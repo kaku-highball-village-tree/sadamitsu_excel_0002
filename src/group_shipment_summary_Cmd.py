@@ -1899,6 +1899,11 @@ STEP0004_TOTAL_COUNT_ITEMS: List[str] = [
     "湯漬過度羽数", "異常鶏羽数", "予備２羽数",
 ]
 
+STEP0006_DISCARD_COUNT_ITEMS: List[str] = [
+    pszItem for pszItem in STEP0004_TOTAL_COUNT_ITEMS
+    if pszItem != "懸鳥前発育不良羽数"
+]
+
 
 def create_step0004_total_count_output_path(
     pszFirstInputPath: str,
@@ -2765,15 +2770,39 @@ def create_step0006_discard_summary_upper_files(
                     "STEP0006_DISCARD_SUMMARY_UPPER_COMMON_COLUMNS_MISMATCH",
                     "input common columns do not match. Key = " + str(objKey),
                 )
+            arrDiscardOutputHeader = arrDiscardHeader[:4]
+            arrDiscardOutputFields = arrDiscardFields[:4]
+            objDiscardSubtotal = Decimal("0")
+            for iItem, pszItem in enumerate(STEP0004_TOTAL_COUNT_ITEMS):
+                if pszItem not in STEP0006_DISCARD_COUNT_ITEMS:
+                    continue
+                arrDiscardOutputHeader.append(arrDiscardHeader[4 + iItem])
+                arrDiscardOutputFields.append(arrDiscardFields[4 + iItem])
+                objValue = parse_decimal_value(
+                    arrDiscardFields[4 + iItem].replace(",", ""),
+                    2,
+                    4 + iItem,
+                    pszItem,
+                )
+                if objValue is None:
+                    raise_conversion_error(
+                        "INVALID_STEP0006_DISCARD_SUMMARY_UPPER_ITEM_VALUE",
+                        "discard count value was blank. Path = " + dicPair["discard"],
+                    )
+                objDiscardSubtotal += objValue
+            arrDiscardOutputHeader.append("小計")
+            arrDiscardOutputFields.append(
+                format(Decimal(format_sum_value(objDiscardSubtotal)), ",f")
+            )
             arrOutputHeader = (
                 arrPlacementHeader
                 + arrPreHeader[4:]
-                + arrDiscardHeader[4:]
+                + arrDiscardOutputHeader[4:]
             )
             arrOutputFields = (
                 arrPlacementFields
                 + arrPreFields[4:]
-                + arrDiscardFields[4:]
+                + arrDiscardOutputFields[4:]
             )
             pszOutputPath = create_step0006_discard_summary_upper_output_path(
                 dicPair["placement"], objKey[4]
@@ -3180,7 +3209,7 @@ def create_step0007_discard_summary_upper_files(
     arrExpectedHeader = (
         ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"]
         + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"]
-        + STEP0004_TOTAL_COUNT_ITEMS + ["小計"]
+        + STEP0006_DISCARD_COUNT_ITEMS + ["小計"]
     )
     return create_step0007_discard_summary_files(
         arrStep0006UpperPaths, "上段", arrExpectedHeader, False
@@ -3230,7 +3259,7 @@ def normalize_step0008_discard_summary_headers(
     arrUpperExpected = (
         ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"]
         + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"]
-        + STEP0004_TOTAL_COUNT_ITEMS + ["小計", "合計"]
+        + STEP0006_DISCARD_COUNT_ITEMS + ["小計", "合計"]
     )
     arrLowerExpected = (
         ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "出荷羽数", "出荷重量"]
@@ -3252,7 +3281,7 @@ def normalize_step0008_discard_summary_headers(
     )
     for iColumn in range(
         iUpperDiscardStart,
-        iUpperDiscardStart + len(STEP0004_TOTAL_COUNT_ITEMS),
+        iUpperDiscardStart + len(STEP0006_DISCARD_COUNT_ITEMS),
     ):
         arrUpperOutput[iColumn] = ""
     arrUpperOutput[iUpperDiscardStart] = "自主廃棄＋検査廃棄"
@@ -3455,7 +3484,7 @@ def create_step0009_discard_summary_files(
     arrUpperSourceHeader = (
         ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"]
         + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"]
-        + STEP0004_TOTAL_COUNT_ITEMS + ["小計", "合計"]
+        + STEP0006_DISCARD_COUNT_ITEMS + ["小計", "合計"]
     )
     arrLowerSourceHeader = (
         ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "出荷羽数", "出荷重量"]
@@ -3625,7 +3654,7 @@ def create_step0010_discard_summary_files(
     arrUpperSourceHeader = (
         ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"]
         + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"]
-        + STEP0004_TOTAL_COUNT_ITEMS + ["小計", "合計"]
+        + STEP0006_DISCARD_COUNT_ITEMS + ["小計", "合計"]
     )
     arrLowerSourceHeader = (
         ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "出荷羽数", "出荷重量"]
