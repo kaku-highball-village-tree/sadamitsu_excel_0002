@@ -1,0 +1,6911 @@
+# -*- coding: utf-8 -*-
+"""Excelの「詳細データ」シートをTSVファイルへ変換します。"""
+
+import os
+import re
+import sys
+import tempfile
+from datetime import date, datetime, time, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from typing import Any, Dict, List, NoReturn, Optional, Tuple
+
+from openpyxl import Workbook, load_workbook
+from openpyxl.cell.cell import Cell
+from openpyxl.utils import get_column_letter
+
+
+SUPPORTED_EXTENSIONS = {".xlsx", ".xlsm"}
+TARGET_SHEET_NAME = "詳細データ"
+WHITESPACE_ONLY_PATTERN = re.compile(r"^[ \u3000\t\r\n]*$")
+LINE_BREAK_PATTERN = re.compile(r"\r\n|\r|\n|\t")
+COLOR_AND_CONDITION_PATTERN = re.compile(r"\[[^]]*\]")
+QUOTED_TEXT_PATTERN = re.compile(r'"([^"]*)"')
+GROUPS: List[Tuple[str, str]] = [("1", "契約"), ("2", "直営"), ("4", "フリー")]
+AVERAGE_WEIGHT_COLUMN_INDEX = 3
+SHIPPING_COUNT_COLUMN_INDEX = 18
+AGE_COLUMN_INDEX = 19
+SHIPPING_WEIGHT_COLUMN_INDEX = 20
+SIMPLE_AVERAGE_COLUMN_INDEXES = {AGE_COLUMN_INDEX}
+SUM_COLUMN_INDEXES = {4, 5, 17, 18, *range(20, 64)}
+NUMERIC_COLUMN_INDEXES = SIMPLE_AVERAGE_COLUMN_INDEXES | SUM_COLUMN_INDEXES
+STEP0003_ITEMS: List[Tuple[str, int, str, bool]] = [
+    ("入雛羽数", 17, "入雛羽数", False),
+    ("出荷羽数", 18, "出荷羽数", False),
+    ("正味重量", 20, "出荷重量", False),
+    ("平均体重", 3, "平均体重", True),
+    ("懸鳥前死鶏羽数", 24, "懸鳥前死鶏羽数", False),
+    ("懸鳥前発育不良羽数", 25, "懸鳥前発育不良羽数", False),
+    ("懸鳥前死鶏重量", 44, "懸鳥前死鶏重量", False),
+    ("懸鳥前発育不良重量", 45, "懸鳥前発育不良重量", False),
+    ("出荷重量", 20, "出荷重量", False),
+    ("マレック羽数", 27, "マレック羽数", False),
+    ("マレック重量", 47, "マレック重量", False),
+    ("大腸菌症重量", 48, "大腸菌症重量", False),
+    ("大腸菌症羽数", 28, "大腸菌症羽数", False),
+    ("ブドウ球菌症重量", 49, "ブドウ球菌症重量", False),
+    ("敗血症重量", 50, "敗血症重量", False),
+    ("変性重量", 51, "変性重量", False),
+    ("腹水症重量", 52, "腹水症重量", False),
+    ("出血重量", 53, "出血重量", False),
+    ("炎症重量", 54, "炎症重量", False),
+    ("腫瘍重量", 55, "腫瘍重量", False),
+    ("黄疸重量", 56, "黄疸重量", False),
+    ("発育不良重量", 57, "発育不良重量", False),
+    ("放血不良重量", 58, "放血不良重量", False),
+    ("湯漬過度重量", 59, "湯漬過度重量", False),
+    ("異常鶏重量", 60, "異常鶏重量", False),
+    ("予備２重量", 61, "予備２重量", False),
+    ("予備３重量", 62, "予備３重量", False),
+    ("予備４重量", 63, "予備４重量", False),
+    ("ブドウ球菌症羽数", 29, "ブドウ球菌症羽数", False),
+    ("敗血症羽数", 30, "敗血症羽数", False),
+    ("変性羽数", 31, "変性羽数", False),
+    ("腹水症羽数", 32, "腹水症羽数", False),
+    ("出血羽数", 33, "出血羽数", False),
+    ("炎症羽数", 34, "炎症羽数", False),
+    ("腫瘍羽数", 35, "腫瘍羽数", False),
+    ("黄疸羽数", 36, "黄疸羽数", False),
+    ("発育不良羽数", 37, "発育不良羽数", False),
+    ("放血不良羽数", 38, "放血不良羽数", False),
+    ("湯漬過度羽数", 39, "湯漬過度羽数", False),
+    ("異常鶏羽数", 40, "異常鶏羽数", False),
+    ("予備２羽数", 41, "予備２羽数", False),
+    ("予備３羽数", 42, "予備３羽数", False),
+    ("予備４羽数", 43, "予備４羽数", False),
+]
+STEP0004_ITEMS: List[Tuple[str, bool]] = [
+    ("入雛羽数", False),
+    ("出荷羽数", False),
+    ("正味重量", False),
+    ("平均体重", True),
+]
+STEP0004_HEADER = "年\t月\tｸﾞﾙｰﾌﾟ№\tｸﾞﾙｰﾌﾟ名\t入雛羽数\t出荷羽数\t正味重量\t平均体重"
+
+
+class ConversionError(Exception):
+    def __init__(self, pszErrorCode: str, pszMessage: str) -> None:
+        super().__init__(pszMessage)
+        self.pszErrorCode = pszErrorCode
+
+
+def raise_conversion_error(pszErrorCode: str, pszMessage: str) -> NoReturn:
+    raise ConversionError(pszErrorCode, pszMessage)
+
+
+def validate_paths(pszOutputTsvPath: str, pszInputExcelPath: str) -> None:
+    if not os.path.isfile(pszInputExcelPath):
+        raise_conversion_error(
+            "INPUT_FILE_NOT_FOUND",
+            "input Excel file was not found. Path = " + pszInputExcelPath,
+        )
+    if os.path.splitext(pszInputExcelPath)[1].lower() not in SUPPORTED_EXTENSIONS:
+        raise_conversion_error(
+            "UNSUPPORTED_INPUT_EXTENSION",
+            "unsupported Excel extension. Path = " + pszInputExcelPath,
+        )
+    if os.path.splitext(pszOutputTsvPath)[1].lower() != ".tsv":
+        raise_conversion_error(
+            "INVALID_OUTPUT_EXTENSION",
+            "output file extension must be .tsv. Path = " + pszOutputTsvPath,
+        )
+
+    pszOutputDirectory: str = os.path.dirname(pszOutputTsvPath)
+    if not os.path.isdir(pszOutputDirectory):
+        raise_conversion_error(
+            "OUTPUT_DIRECTORY_NOT_FOUND",
+            "output directory was not found. Path = " + pszOutputDirectory,
+        )
+    if os.path.isdir(pszOutputTsvPath):
+        raise_conversion_error(
+            "INVALID_OUTPUT_PATH",
+            "output path points to a directory. Path = " + pszOutputTsvPath,
+        )
+    if os.path.normcase(pszInputExcelPath) == os.path.normcase(pszOutputTsvPath):
+        raise_conversion_error(
+            "INPUT_OUTPUT_PATH_CONFLICT",
+            "input and output paths must be different. Path = " + pszInputExcelPath,
+        )
+    if os.path.exists(pszOutputTsvPath):
+        raise_conversion_error(
+            "OUTPUT_ALREADY_EXISTS",
+            "output TSV already exists. Path = " + pszOutputTsvPath,
+        )
+
+
+def create_error_path(pszInputExcelPath: str) -> str:
+    pszDirectory: str = os.path.dirname(pszInputExcelPath)
+    pszBaseName: str = os.path.splitext(os.path.basename(pszInputExcelPath))[0]
+    pszStem: str = pszBaseName + "_error"
+    pszErrorPath: str = os.path.join(pszDirectory, pszStem + ".txt")
+    iSuffix: int = 2
+    while os.path.exists(pszErrorPath):
+        pszErrorPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.txt")
+        iSuffix += 1
+    return pszErrorPath
+
+
+def write_error_file(
+    pszInputExcelPath: str, pszErrorCode: str, pszErrorDetail: str
+) -> str:
+    while True:
+        pszErrorPath: str = create_error_path(pszInputExcelPath)
+        try:
+            with open(pszErrorPath, "x", encoding="utf-8", newline="") as objErrorFile:
+                objErrorFile.write(
+                    "ExcelからTSVへの変換、年月別分割、グループ別集計、または"
+                    "step0003抽出・step0004結合・step0005年間連結・"
+                    "step0006年間行列入れ替え・step0007年間グループ連結・"
+                    "step0007年間Excel作成・step0008育成率追加に"
+                    "失敗しました。\r\n"
+                )
+                objErrorFile.write("エラー種別: " + pszErrorCode + "\r\n")
+                objErrorFile.write("入力Excel: " + pszInputExcelPath + "\r\n")
+                objErrorFile.write("対象シート: " + TARGET_SHEET_NAME + "\r\n")
+                objErrorFile.write("エラー詳細: " + pszErrorDetail + "\r\n")
+            return pszErrorPath
+        except FileExistsError:
+            continue
+
+
+def normalize_cell_text(pszValue: str) -> str:
+    if WHITESPACE_ONLY_PATTERN.fullmatch(pszValue):
+        return ""
+    return LINE_BREAK_PATTERN.sub(" ", pszValue)
+
+
+def select_number_format_section(pszNumberFormat: str, objValue: Any) -> str:
+    arrSections = pszNumberFormat.split(";")
+    if not isinstance(objValue, (int, float, Decimal)) or isinstance(objValue, bool):
+        return arrSections[3] if len(arrSections) >= 4 else arrSections[0]
+    if objValue > 0:
+        return arrSections[0]
+    if objValue < 0:
+        return arrSections[1] if len(arrSections) >= 2 else arrSections[0]
+    return arrSections[2] if len(arrSections) >= 3 else arrSections[0]
+
+
+def clean_number_format(pszNumberFormat: str) -> str:
+    pszFormat: str = COLOR_AND_CONDITION_PATTERN.sub("", pszNumberFormat)
+    pszFormat = pszFormat.replace("\\-", "-").replace("\\/", "/")
+    pszFormat = pszFormat.replace("\\ ", " ").replace("_", "")
+    pszFormat = re.sub(r"\*.", "", pszFormat)
+    return pszFormat
+
+
+def excel_datetime_format_to_strftime(pszNumberFormat: str) -> Tuple[str, bool, bool, bool, bool]:
+    pszFormat: str = clean_number_format(pszNumberFormat)
+    pszFormat = QUOTED_TEXT_PATTERN.sub(lambda objMatch: objMatch.group(1), pszFormat)
+    pszFormat = re.sub(r"\[h\]", "%H", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"AM/PM", "%p", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"yyyy", "%Y", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"yy", "%y", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"mmmm", "%B", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"mmm", "%b", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"dddd", "%A", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"ddd", "%a", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"dd", "%d", pszFormat, flags=re.IGNORECASE)
+    pszFormat, iSingleDayCount = re.subn(
+        r"(?<!%)d", "{EXCEL_DAY}", pszFormat, flags=re.IGNORECASE
+    )
+    pszFormat = re.sub(r"hh", "%H", pszFormat, flags=re.IGNORECASE)
+    pszFormat, iSingleHourCount = re.subn(
+        r"(?<!%)h", "{EXCEL_HOUR}", pszFormat, flags=re.IGNORECASE
+    )
+    pszFormat = re.sub(r"ss", "%S", pszFormat, flags=re.IGNORECASE)
+    pszFormat = re.sub(r"(?<!%)s", "%-S", pszFormat, flags=re.IGNORECASE)
+
+    # Excelのmは、時刻部分では分、それ以外では月を表します。
+    bTimeContext: bool = bool(re.search(r"%H|%S", pszFormat))
+    pszMonthOrMinute: str = "%M" if bTimeContext else "%m"
+    pszFormat = re.sub(r"mm", pszMonthOrMinute, pszFormat, flags=re.IGNORECASE)
+    pszFormat, iSingleMonthMinuteCount = re.subn(
+        r"(?<!%)m",
+        "{EXCEL_MINUTE}" if bTimeContext else "{EXCEL_MONTH}",
+        pszFormat,
+        flags=re.IGNORECASE,
+    )
+    return (
+        pszFormat,
+        iSingleDayCount > 0,
+        iSingleHourCount > 0,
+        iSingleMonthMinuteCount > 0 and not bTimeContext,
+        iSingleMonthMinuteCount > 0 and bTimeContext,
+    )
+
+
+def format_datetime_value(objValue: Any, pszNumberFormat: str) -> str:
+    (
+        pszFormat,
+        bSingleDay,
+        bSingleHour,
+        bSingleMonth,
+        bSingleMinute,
+    ) = excel_datetime_format_to_strftime(pszNumberFormat)
+    try:
+        pszResult: str = objValue.strftime(pszFormat)
+        if bSingleDay:
+            pszResult = pszResult.replace("{EXCEL_DAY}", str(objValue.day))
+        if bSingleHour:
+            pszResult = pszResult.replace("{EXCEL_HOUR}", str(objValue.hour))
+        if bSingleMonth:
+            pszResult = pszResult.replace("{EXCEL_MONTH}", str(objValue.month))
+        if bSingleMinute:
+            pszResult = pszResult.replace("{EXCEL_MINUTE}", str(objValue.minute))
+        return pszResult
+    except (ValueError, TypeError):
+        if isinstance(objValue, datetime):
+            return objValue.isoformat(sep=" ")
+        if isinstance(objValue, (date, time)):
+            return objValue.isoformat()
+        if isinstance(objValue, timedelta):
+            return str(objValue)
+        return str(objValue)
+
+
+def decimal_places_from_format(pszNumberFormat: str) -> int:
+    pszFormat: str = clean_number_format(pszNumberFormat)
+    objMatch = re.search(r"[0#?]+\.([0#?]+)", pszFormat)
+    return len(objMatch.group(1)) if objMatch else 0
+
+
+def format_numeric_value(objValue: Any, pszNumberFormat: str) -> str:
+    pszSection: str = clean_number_format(
+        select_number_format_section(pszNumberFormat, objValue)
+    )
+    if pszSection.lower() == "general":
+        return str(objValue)
+
+    bPercent: bool = "%" in pszSection
+    bThousands: bool = bool(re.search(r"[0#?],[0#?]", pszSection))
+    iDecimalPlaces: int = decimal_places_from_format(pszSection)
+    objDecimal = Decimal(str(objValue))
+    if bPercent:
+        objDecimal *= Decimal("100")
+
+    pszIntegerPattern: str = pszSection.split(".", 1)[0]
+    pszIntegerPattern = re.sub(r'"[^"]*"', "", pszIntegerPattern)
+    pszIntegerPattern = re.sub(r"[^0#?]", "", pszIntegerPattern)
+    iMinimumIntegerDigits: int = pszIntegerPattern.count("0")
+
+    try:
+        objQuantum = Decimal(1).scaleb(-iDecimalPlaces)
+        objRounded = objDecimal.quantize(objQuantum, rounding=ROUND_HALF_UP)
+    except InvalidOperation:
+        return str(objValue)
+
+    pszSpecification: str = ("," if bThousands else "") + "." + str(iDecimalPlaces) + "f"
+    pszResult: str = format(abs(objRounded), pszSpecification)
+    if iMinimumIntegerDigits > 1 and not bThousands:
+        pszInteger, pszSeparator, pszFraction = pszResult.partition(".")
+        pszInteger = pszInteger.zfill(iMinimumIntegerDigits)
+        pszResult = pszInteger + (pszSeparator + pszFraction if pszSeparator else "")
+    if objDecimal < 0:
+        if "(" in pszSection and ")" in pszSection:
+            pszResult = "(" + pszResult + ")"
+        else:
+            pszResult = "-" + pszResult
+    if bPercent:
+        pszResult += "%"
+
+    arrLiteralTexts = QUOTED_TEXT_PATTERN.findall(pszSection)
+    if arrLiteralTexts:
+        pszResult = "".join(arrLiteralTexts[:1]) + pszResult + "".join(arrLiteralTexts[1:])
+    return pszResult
+
+
+def format_cell_value(objCell: Cell, objValue: Any) -> str:
+    if objValue is None:
+        return ""
+    if isinstance(objValue, str):
+        return normalize_cell_text(objValue)
+    if isinstance(objValue, bool):
+        return "TRUE" if objValue else "FALSE"
+    if isinstance(objValue, (datetime, date, time, timedelta)):
+        return normalize_cell_text(format_datetime_value(objValue, objCell.number_format))
+    if isinstance(objValue, (int, float, Decimal)):
+        return normalize_cell_text(format_numeric_value(objValue, objCell.number_format))
+    return normalize_cell_text(str(objValue))
+
+
+def has_data_value(objValue: Any) -> bool:
+    if objValue is None:
+        return False
+    if isinstance(objValue, str):
+        return normalize_cell_text(objValue) != ""
+    return True
+
+
+def find_data_bounds(
+    objFormulaWorksheet: Any, objValueWorksheet: Any
+) -> Optional[Tuple[int, int]]:
+    iLastRow: int = 0
+    for iRow in range(2, objFormulaWorksheet.max_row + 1):
+        if all(
+            has_data_value(objValueWorksheet.cell(iRow, iColumn).value)
+            for iColumn in range(1, 4)
+        ):
+            iLastRow = iRow
+
+    if iLastRow == 0:
+        return None
+
+    iLastColumn: int = 0
+    for objRow in objFormulaWorksheet.iter_rows(
+        min_row=1, max_row=iLastRow
+    ):
+        for objCell in objRow:
+            if objCell.value is not None:
+                iLastColumn = max(iLastColumn, objCell.column)
+    if iLastColumn == 0:
+        return None
+    return iLastRow, iLastColumn
+
+
+def reserve_output_path(pszOutputTsvPath: str) -> None:
+    try:
+        iFileDescriptor: int = os.open(
+            pszOutputTsvPath, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        )
+        os.close(iFileDescriptor)
+    except FileExistsError:
+        raise_conversion_error(
+            "OUTPUT_ALREADY_EXISTS",
+            "output TSV already exists. Path = " + pszOutputTsvPath,
+        )
+    except OSError as objException:
+        raise_conversion_error(
+            "TSV_TEMP_CREATE_FAILED",
+            "failed to reserve output TSV. Detail = " + str(objException),
+        )
+
+
+def strip_line_ending(pszLine: str) -> str:
+    if pszLine.endswith("\r\n"):
+        return pszLine[:-2]
+    if pszLine.endswith("\r") or pszLine.endswith("\n"):
+        return pszLine[:-1]
+    return pszLine
+
+
+def parse_year_month(pszYear: str, pszMonth: str, iLineNumber: int) -> Tuple[int, int]:
+    pszNormalizedYear: str = pszYear.strip(" \u3000\t")
+    pszNormalizedMonth: str = pszMonth.strip(" \u3000\t")
+    try:
+        objYear = Decimal(pszNormalizedYear)
+        objMonth = Decimal(pszNormalizedMonth)
+        if not objYear.is_finite() or objYear != objYear.to_integral_value():
+            raise InvalidOperation
+        if not objMonth.is_finite() or objMonth != objMonth.to_integral_value():
+            raise InvalidOperation
+        iYear: int = int(objYear)
+        iMonth: int = int(objMonth)
+    except (InvalidOperation, ValueError, OverflowError):
+        raise_conversion_error(
+            "INVALID_YEAR_MONTH",
+            "invalid year or month in TSV. Line = "
+            + str(iLineNumber)
+            + ", Year = "
+            + pszYear
+            + ", Month = "
+            + pszMonth,
+        )
+
+    if iYear < 1 or iYear > 9999 or iMonth < 1 or iMonth > 12:
+        raise_conversion_error(
+            "INVALID_YEAR_MONTH",
+            "invalid year or month in TSV. Line = "
+            + str(iLineNumber)
+            + ", Year = "
+            + pszYear
+            + ", Month = "
+            + pszMonth,
+        )
+    return iYear, iMonth
+
+
+def read_tsv_by_month(
+    pszSourceTsvPath: str,
+) -> Tuple[str, Dict[Tuple[int, int], List[str]]]:
+    try:
+        with open(pszSourceTsvPath, "r", encoding="utf-8", newline="") as objTsvFile:
+            arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objTsvFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "SOURCE_TSV_READ_FAILED",
+            "failed to read source TSV. Detail = " + str(objException),
+        )
+
+    if not arrLines or arrLines[0] == "":
+        raise_conversion_error("SOURCE_TSV_HEADER_MISSING", "source TSV header was missing.")
+    if len(arrLines[0].split("\t")) < 2:
+        raise_conversion_error(
+            "SOURCE_TSV_COLUMN_MISSING",
+            "source TSV must contain year and month columns.",
+        )
+
+    dicRowsByMonth: Dict[Tuple[int, int], List[str]] = {}
+    for iLineNumber, pszLine in enumerate(arrLines[1:], start=2):
+        arrFields: List[str] = pszLine.split("\t")
+        if len(arrFields) < 2:
+            raise_conversion_error(
+                "SOURCE_TSV_COLUMN_MISSING",
+                "source TSV row must contain year and month columns. Line = "
+                + str(iLineNumber),
+            )
+        objYearMonth: Tuple[int, int] = parse_year_month(
+            arrFields[0], arrFields[1], iLineNumber
+        )
+        dicRowsByMonth.setdefault(objYearMonth, []).append(pszLine)
+
+    if not dicRowsByMonth:
+        raise_conversion_error(
+            "INVALID_YEAR_MONTH", "source TSV did not contain any data rows."
+        )
+    return arrLines[0], dicRowsByMonth
+
+
+def create_monthly_output_path(
+    pszSourceTsvPath: str, iYear: int, iMonth: int
+) -> str:
+    pszDirectory: str = os.path.dirname(pszSourceTsvPath)
+    pszBaseName: str = os.path.splitext(os.path.basename(pszSourceTsvPath))[0]
+    pszStem: str = f"{pszBaseName}_step0001_{iYear:04d}_{iMonth:02d}"
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def write_monthly_tsv(
+    pszOutputPath: str, pszHeader: str, arrRows: List[str]
+) -> None:
+    pszTemporaryPath: str = ""
+    bOutputReserved: bool = False
+    try:
+        try:
+            iFileDescriptor: int = os.open(
+                pszOutputPath, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.close(iFileDescriptor)
+            bOutputReserved = True
+        except FileExistsError:
+            raise_conversion_error(
+                "MONTHLY_OUTPUT_ALREADY_EXISTS",
+                "monthly TSV already exists. Path = " + pszOutputPath,
+            )
+        except OSError as objException:
+            raise_conversion_error(
+                "MONTHLY_TSV_CREATE_FAILED",
+                "failed to reserve monthly TSV. Detail = " + str(objException),
+            )
+
+        try:
+            iTemporaryFileDescriptor, pszTemporaryPath = tempfile.mkstemp(
+                prefix="group_shipment_summary_monthly_",
+                suffix=".tsv",
+                dir=os.path.dirname(pszOutputPath),
+            )
+            os.close(iTemporaryFileDescriptor)
+            with open(pszTemporaryPath, "w", encoding="utf-8", newline="") as objFile:
+                objFile.write(pszHeader + "\r\n")
+                for pszRow in arrRows:
+                    objFile.write(pszRow + "\r\n")
+        except Exception as objException:
+            raise_conversion_error(
+                "MONTHLY_TSV_WRITE_FAILED",
+                "failed to write monthly TSV. Detail = " + str(objException),
+            )
+
+        try:
+            os.replace(pszTemporaryPath, pszOutputPath)
+            pszTemporaryPath = ""
+            bOutputReserved = False
+        except Exception as objException:
+            raise_conversion_error(
+                "MONTHLY_TSV_FINALIZE_FAILED",
+                "failed to finalize monthly TSV. Detail = " + str(objException),
+            )
+    finally:
+        if pszTemporaryPath and os.path.exists(pszTemporaryPath):
+            os.remove(pszTemporaryPath)
+        if bOutputReserved and os.path.exists(pszOutputPath):
+            os.remove(pszOutputPath)
+
+
+def split_tsv_by_month(
+    pszSourceTsvPath: str,
+) -> Tuple[List[str], Tuple[int, int], Tuple[int, int]]:
+    pszHeader, dicRowsByMonth = read_tsv_by_month(pszSourceTsvPath)
+    arrYearMonths: List[Tuple[int, int]] = sorted(dicRowsByMonth)
+    arrOutputPlans: List[Tuple[str, List[str]]] = [
+        (
+            create_monthly_output_path(pszSourceTsvPath, iYear, iMonth),
+            dicRowsByMonth[(iYear, iMonth)],
+        )
+        for iYear, iMonth in arrYearMonths
+    ]
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszOutputPath, arrRows in arrOutputPlans:
+            write_monthly_tsv(pszOutputPath, pszHeader, arrRows)
+            arrCreatedPaths.append(pszOutputPath)
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszCreatedPath in arrCreatedPaths:
+            try:
+                os.remove(pszCreatedPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(
+                    pszCreatedPath + ": " + str(objCleanupException)
+                )
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "MONTHLY_OUTPUT_CLEANUP_FAILED",
+                "monthly TSV creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+    return arrCreatedPaths, arrYearMonths[0], arrYearMonths[-1]
+
+
+def create_step0002_output_path(pszStep0001Path: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0001Path)
+    pszFileName: str = os.path.basename(pszStep0001Path)
+    if "_step0001_" not in pszFileName:
+        raise_conversion_error(
+            "INVALID_STEP0001_FILE_NAME",
+            "step0001 marker was not found. Path = " + pszStep0001Path,
+        )
+    pszStem: str = os.path.splitext(pszFileName.replace("_step0001_", "_step0002_グループ別_", 1))[0]
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0002_total_output_path(pszStep0001Path: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0001Path)
+    pszFileName: str = os.path.basename(pszStep0001Path)
+    if "_step0001_" not in pszFileName:
+        raise_conversion_error(
+            "INVALID_STEP0001_FILE_NAME",
+            "step0001 marker was not found. Path = " + pszStep0001Path,
+        )
+    pszStem: str = os.path.splitext(pszFileName.replace("_step0001_", "_step0002_総計_", 1))[0]
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def parse_decimal_value(
+    pszValue: str, iLineNumber: int, iColumnIndex: int, pszColumnName: str
+) -> Optional[Decimal]:
+    pszNormalizedValue: str = pszValue.strip(" \u3000\t")
+    if pszNormalizedValue == "":
+        return None
+    try:
+        objValue = Decimal(pszNormalizedValue)
+    except InvalidOperation:
+        objValue = Decimal("NaN")
+    if not objValue.is_finite():
+        raise_conversion_error(
+            "NON_NUMERIC_AGGREGATION_VALUE",
+            "non-numeric aggregation value. Line = "
+            + str(iLineNumber)
+            + ", Column = "
+            + str(iColumnIndex + 1)
+            + ", Name = "
+            + pszColumnName
+            + ", Value = "
+            + pszValue,
+        )
+    return objValue
+
+
+def format_sum_value(objValue: Decimal) -> str:
+    pszValue: str = format(objValue, "f")
+    if "." in pszValue:
+        pszValue = pszValue.rstrip("0").rstrip(".")
+    return pszValue if pszValue not in {"", "-0"} else "0"
+
+
+def parse_process_month(pszValue: str, iLineNumber: int) -> Tuple[int, int, str]:
+    pszNormalizedValue: str = pszValue.strip(" \u3000\t")
+    try:
+        objValue = Decimal(pszNormalizedValue)
+        if not objValue.is_finite() or objValue != objValue.to_integral_value():
+            raise InvalidOperation
+        pszDate: str = str(int(objValue))
+        if len(pszDate) != 8:
+            raise ValueError
+        objDate = datetime.strptime(pszDate, "%Y%m%d")
+    except (InvalidOperation, ValueError, OverflowError):
+        raise_conversion_error(
+            "INVALID_PROCESS_DATE",
+            "invalid process date. Line = "
+            + str(iLineNumber)
+            + ", Value = "
+            + pszValue,
+        )
+    return objDate.year, objDate.month, pszDate[:6]
+
+
+def add_warning(
+    arrWarnings: List[Dict[str, str]],
+    pszType: str,
+    pszInputPath: str,
+    pszOutputPath: str,
+    pszProcessMonth: str,
+    pszGroupNumber: str,
+    pszGroupName: str,
+    pszColumns: str,
+    pszReason: str,
+    pszOutputValue: str,
+) -> None:
+    arrWarnings.append(
+        {
+            "type": pszType,
+            "input": pszInputPath,
+            "output": pszOutputPath,
+            "month": pszProcessMonth,
+            "group_number": pszGroupNumber,
+            "group_name": pszGroupName,
+            "columns": pszColumns,
+            "reason": pszReason,
+            "output_value": pszOutputValue,
+        }
+    )
+
+
+def write_step0002_tsv(
+    pszOutputPath: str, pszHeader: str, arrRows: List[str]
+) -> None:
+    try:
+        write_monthly_tsv(pszOutputPath, pszHeader, arrRows)
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0002_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0002_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0002_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0002_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0002_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def aggregate_step0001(
+    pszInputPath: str, pszOutputPath: str, arrWarnings: List[Dict[str, str]]
+) -> None:
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0001_READ_FAILED", "failed to read step0001 TSV. Detail = " + str(objException)
+        )
+    if not arrLines:
+        raise_conversion_error("STEP0001_HEADER_MISSING", "step0001 header was missing.")
+    arrHeader: List[str] = arrLines[0].split("\t")
+    if len(arrHeader) != 64:
+        raise_conversion_error(
+            "INVALID_AGGREGATION_COLUMN_COUNT",
+            "step0001 header must contain 64 columns. Actual = " + str(len(arrHeader)),
+        )
+
+    dicRows: Dict[str, List[Tuple[int, List[str]]]] = {
+        pszGroupName: [] for _, pszGroupName in GROUPS
+    }
+    objYearMonth: Optional[Tuple[int, int]] = None
+    for iLineNumber, pszLine in enumerate(arrLines[1:], start=2):
+        arrFields: List[str] = pszLine.split("\t")
+        if len(arrFields) != 64:
+            raise_conversion_error(
+                "INVALID_AGGREGATION_COLUMN_COUNT",
+                "step0001 row must contain 64 columns. Line = "
+                + str(iLineNumber)
+                + ", Actual = "
+                + str(len(arrFields)),
+            )
+        iYear, iMonth = parse_year_month(arrFields[0], arrFields[1], iLineNumber)
+        iProcessYear, iProcessMonth, _ = parse_process_month(arrFields[14], iLineNumber)
+        if (iYear, iMonth) != (iProcessYear, iProcessMonth):
+            raise_conversion_error(
+                "YEAR_MONTH_MISMATCH",
+                "year/month and process date do not match. Line = " + str(iLineNumber),
+            )
+        if objYearMonth is None:
+            objYearMonth = (iYear, iMonth)
+        elif objYearMonth != (iYear, iMonth):
+            raise_conversion_error(
+                "YEAR_MONTH_MISMATCH", "multiple year/month values in step0001 TSV."
+            )
+
+        pszGroupNumber: str = arrFields[10].strip(" \u3000\t")
+        pszGroupName: str = arrFields[11].strip(" \u3000\t")
+        dicExpectedGroups: Dict[str, str] = {pszName: pszNumber for pszNumber, pszName in GROUPS}
+        if pszGroupName not in dicExpectedGroups:
+            raise_conversion_error(
+                "INVALID_GROUP_NAME",
+                "unsupported group name. Line = " + str(iLineNumber) + ", Value = " + pszGroupName,
+            )
+        if pszGroupNumber != dicExpectedGroups[pszGroupName]:
+            raise_conversion_error(
+                "INVALID_GROUP_MAPPING",
+                "group number and name do not match. Line = " + str(iLineNumber),
+            )
+        for iColumnIndex in NUMERIC_COLUMN_INDEXES:
+            parse_decimal_value(
+                arrFields[iColumnIndex], iLineNumber, iColumnIndex, arrHeader[iColumnIndex]
+            )
+        dicRows[pszGroupName].append((iLineNumber, arrFields))
+
+    if objYearMonth is None:
+        raise_conversion_error("STEP0001_DATA_MISSING", "step0001 did not contain data rows.")
+    iYear, iMonth = objYearMonth
+    pszProcessMonth: str = f"{iYear:04d}{iMonth:02d}"
+    arrOutputRows: List[str] = []
+    for pszGroupNumber, pszGroupName in GROUPS:
+        arrGroupRows = dicRows[pszGroupName]
+        arrOutput: List[str] = ["－"] * 64
+        arrOutput[0] = f"{iYear:04d}"
+        arrOutput[1] = f"{iMonth:02d}"
+        arrOutput[10] = pszGroupNumber
+        arrOutput[11] = pszGroupName
+        arrOutput[14] = pszProcessMonth
+
+        if not arrGroupRows:
+            arrOutput[3] = ""
+            arrOutput[19] = ""
+            for iColumnIndex in SUM_COLUMN_INDEXES:
+                arrOutput[iColumnIndex] = "0"
+            add_warning(
+                arrWarnings,
+                "MISSING_GROUP_DATA",
+                pszInputPath,
+                pszOutputPath,
+                pszProcessMonth,
+                pszGroupNumber,
+                pszGroupName,
+                "4(D), 5(E), 6(F), 18(R)-64(BL)",
+                "group contains no input rows.",
+                "average columns are empty; sum columns are 0",
+            )
+        else:
+            dicColumnValues: Dict[int, List[Decimal]] = {}
+            for iColumnIndex in sorted(NUMERIC_COLUMN_INDEXES):
+                arrValues: List[Decimal] = []
+                for iLineNumber, arrFields in arrGroupRows:
+                    objValue = parse_decimal_value(
+                        arrFields[iColumnIndex],
+                        iLineNumber,
+                        iColumnIndex,
+                        arrHeader[iColumnIndex],
+                    )
+                    if objValue is not None:
+                        arrValues.append(objValue)
+                dicColumnValues[iColumnIndex] = arrValues
+                if not arrValues:
+                    bAverage: bool = iColumnIndex in SIMPLE_AVERAGE_COLUMN_INDEXES
+                    arrOutput[iColumnIndex] = "" if bAverage else "0"
+                    add_warning(
+                        arrWarnings,
+                        "ALL_BLANK_AVERAGE_COLUMN" if bAverage else "ALL_BLANK_SUM_COLUMN",
+                        pszInputPath,
+                        pszOutputPath,
+                        pszProcessMonth,
+                        pszGroupNumber,
+                        pszGroupName,
+                        str(iColumnIndex + 1)
+                        + "("
+                        + get_column_letter(iColumnIndex + 1)
+                        + ") "
+                        + arrHeader[iColumnIndex],
+                        "column contains no numeric values.",
+                        "empty" if bAverage else "0",
+                    )
+                elif iColumnIndex in SIMPLE_AVERAGE_COLUMN_INDEXES:
+                    objAverage = sum(arrValues, Decimal("0")) / Decimal(len(arrValues))
+                    arrOutput[iColumnIndex] = format(
+                        objAverage.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f"
+                    )
+                else:
+                    arrOutput[iColumnIndex] = format_sum_value(
+                        sum(arrValues, Decimal("0"))
+                    )
+
+            arrShippingCounts: List[Decimal] = dicColumnValues[
+                SHIPPING_COUNT_COLUMN_INDEX
+            ]
+            objShippingCountTotal: Decimal = sum(
+                arrShippingCounts, Decimal("0")
+            )
+            if not arrShippingCounts:
+                arrOutput[AVERAGE_WEIGHT_COLUMN_INDEX] = ""
+            elif objShippingCountTotal == 0:
+                arrOutput[AVERAGE_WEIGHT_COLUMN_INDEX] = ""
+                add_warning(
+                    arrWarnings,
+                    "AVERAGE_WEIGHT_DIVISION_BY_ZERO",
+                    pszInputPath,
+                    pszOutputPath,
+                    pszProcessMonth,
+                    pszGroupNumber,
+                    pszGroupName,
+                    "4(D) 平均体重, 19(S) 出荷羽数, 21(U) 出荷重量",
+                    "shipping count total is zero; average weight cannot be calculated.",
+                    "empty",
+                )
+            else:
+                objShippingWeightTotal: Decimal = sum(
+                    dicColumnValues[SHIPPING_WEIGHT_COLUMN_INDEX], Decimal("0")
+                )
+                objAverageWeight: Decimal = (
+                    objShippingWeightTotal / objShippingCountTotal
+                )
+                arrOutput[AVERAGE_WEIGHT_COLUMN_INDEX] = format(
+                    objAverageWeight.quantize(
+                        Decimal("0.00001"), rounding=ROUND_HALF_UP
+                    ),
+                    ".5f",
+                )
+        arrOutputRows.append("\t".join(arrOutput))
+    write_step0002_tsv(pszOutputPath, "\t".join(arrHeader), arrOutputRows)
+
+
+def create_warning_path(pszInputExcelPath: str) -> str:
+    pszDirectory: str = os.path.dirname(pszInputExcelPath)
+    pszBaseName: str = os.path.splitext(os.path.basename(pszInputExcelPath))[0]
+    pszStem: str = pszBaseName + "_warning"
+    pszPath: str = os.path.join(pszDirectory, pszStem + ".txt")
+    iSuffix: int = 2
+    while os.path.exists(pszPath):
+        pszPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.txt")
+        iSuffix += 1
+    return pszPath
+
+
+def write_warning_file(
+    pszInputExcelPath: str, arrWarnings: List[Dict[str, str]]
+) -> str:
+    pszWarningPath: str = create_warning_path(pszInputExcelPath)
+    try:
+        with open(pszWarningPath, "x", encoding="utf-8", newline="") as objFile:
+            objFile.write("月次・グループ別集計が警告付きで完了しました。\r\n")
+            objFile.write("入力Excel: " + pszInputExcelPath + "\r\n")
+            objFile.write("警告件数: " + str(len(arrWarnings)) + "\r\n")
+            for iIndex, dicWarning in enumerate(arrWarnings, start=1):
+                objFile.write("\r\n[警告 " + str(iIndex) + "]\r\n")
+                objFile.write("警告種別: " + dicWarning["type"] + "\r\n")
+                objFile.write("入力step0001: " + dicWarning["input"] + "\r\n")
+                objFile.write("出力step0002: " + dicWarning["output"] + "\r\n")
+                objFile.write("処理年月: " + dicWarning["month"] + "\r\n")
+                objFile.write("グループ№: " + dicWarning["group_number"] + "\r\n")
+                objFile.write("グループ名: " + dicWarning["group_name"] + "\r\n")
+                objFile.write("対象列: " + dicWarning["columns"] + "\r\n")
+                objFile.write("警告理由: " + dicWarning["reason"] + "\r\n")
+                objFile.write("出力値: " + dicWarning["output_value"] + "\r\n")
+        return pszWarningPath
+    except Exception as objException:
+        if os.path.exists(pszWarningPath):
+            os.remove(pszWarningPath)
+        raise_conversion_error(
+            "WARNING_FILE_CREATE_FAILED",
+            "failed to create warning file. Detail = " + str(objException),
+        )
+
+
+def aggregate_step0001_files(
+    arrStep0001Paths: List[str], pszInputExcelPath: str
+) -> Tuple[List[str], str, int]:
+    arrStep0002Paths: List[str] = []
+    arrWarnings: List[Dict[str, str]] = []
+    try:
+        for pszStep0001Path in arrStep0001Paths:
+            pszStep0002Path: str = create_step0002_output_path(pszStep0001Path)
+            aggregate_step0001(pszStep0001Path, pszStep0002Path, arrWarnings)
+            arrStep0002Paths.append(pszStep0002Path)
+        pszWarningPath: str = ""
+        if arrWarnings:
+            pszWarningPath = write_warning_file(pszInputExcelPath, arrWarnings)
+        return arrStep0002Paths, pszWarningPath, len(arrWarnings)
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrStep0002Paths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0002_CLEANUP_FAILED",
+                "step0002 aggregation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def aggregate_step0001_total(
+    pszInputPath: str, pszOutputPath: str, arrWarnings: List[Dict[str, str]]
+) -> None:
+    """step0001の全明細から、丸め前の値で月次総計を計算します。"""
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0001_READ_FAILED", "failed to read step0001 TSV. Detail = " + str(objException)
+        )
+    if not arrLines:
+        raise_conversion_error("STEP0001_HEADER_MISSING", "step0001 header was missing.")
+    arrHeader: List[str] = arrLines[0].split("\t")
+    if len(arrHeader) != 64:
+        raise_conversion_error(
+            "INVALID_AGGREGATION_COLUMN_COUNT",
+            "step0001 header must contain 64 columns. Actual = " + str(len(arrHeader)),
+        )
+
+    arrTotalRows: List[Tuple[int, List[str]]] = []
+    objYearMonth: Optional[Tuple[int, int]] = None
+    for iLineNumber, pszLine in enumerate(arrLines[1:], start=2):
+        arrFields: List[str] = pszLine.split("\t")
+        if len(arrFields) != 64:
+            raise_conversion_error(
+                "INVALID_AGGREGATION_COLUMN_COUNT",
+                "step0001 row must contain 64 columns. Line = "
+                + str(iLineNumber)
+                + ", Actual = "
+                + str(len(arrFields)),
+            )
+        iYear, iMonth = parse_year_month(arrFields[0], arrFields[1], iLineNumber)
+        iProcessYear, iProcessMonth, _ = parse_process_month(arrFields[14], iLineNumber)
+        if (iYear, iMonth) != (iProcessYear, iProcessMonth):
+            raise_conversion_error(
+                "YEAR_MONTH_MISMATCH",
+                "year/month and process date do not match. Line = " + str(iLineNumber),
+            )
+        if objYearMonth is None:
+            objYearMonth = (iYear, iMonth)
+        elif objYearMonth != (iYear, iMonth):
+            raise_conversion_error(
+                "YEAR_MONTH_MISMATCH", "multiple year/month values in step0001 TSV."
+            )
+
+        pszGroupNumber: str = arrFields[10].strip(" \u3000\t")
+        pszGroupName: str = arrFields[11].strip(" \u3000\t")
+        dicExpectedGroups: Dict[str, str] = {pszName: pszNumber for pszNumber, pszName in GROUPS}
+        if pszGroupName not in dicExpectedGroups:
+            raise_conversion_error(
+                "INVALID_GROUP_NAME",
+                "unsupported group name. Line = " + str(iLineNumber) + ", Value = " + pszGroupName,
+            )
+        if pszGroupNumber != dicExpectedGroups[pszGroupName]:
+            raise_conversion_error(
+                "INVALID_GROUP_MAPPING",
+                "group number and name do not match. Line = " + str(iLineNumber),
+            )
+        for iColumnIndex in NUMERIC_COLUMN_INDEXES:
+            parse_decimal_value(
+                arrFields[iColumnIndex], iLineNumber, iColumnIndex, arrHeader[iColumnIndex]
+            )
+        arrTotalRows.append((iLineNumber, arrFields))
+
+    if objYearMonth is None:
+        raise_conversion_error("STEP0001_DATA_MISSING", "step0001 did not contain data rows.")
+    iYear, iMonth = objYearMonth
+    pszProcessMonth: str = f"{iYear:04d}{iMonth:02d}"
+    pszGroupNumber: str = ""
+    pszGroupName: str = "総計"
+    arrGroupRows = arrTotalRows
+    arrOutput: List[str] = ["－"] * 64
+    arrOutput[0] = f"{iYear:04d}"
+    arrOutput[1] = f"{iMonth:02d}"
+    arrOutput[10] = pszGroupNumber
+    arrOutput[11] = pszGroupName
+    arrOutput[14] = pszProcessMonth
+
+    dicColumnValues: Dict[int, List[Decimal]] = {}
+    for iColumnIndex in sorted(NUMERIC_COLUMN_INDEXES):
+        arrValues: List[Decimal] = []
+        for iLineNumber, arrFields in arrGroupRows:
+            objValue = parse_decimal_value(
+                arrFields[iColumnIndex],
+                iLineNumber,
+                iColumnIndex,
+                arrHeader[iColumnIndex],
+            )
+            if objValue is not None:
+                arrValues.append(objValue)
+        dicColumnValues[iColumnIndex] = arrValues
+        if not arrValues:
+            bAverage: bool = iColumnIndex in SIMPLE_AVERAGE_COLUMN_INDEXES
+            arrOutput[iColumnIndex] = "" if bAverage else "0"
+            add_warning(
+                arrWarnings,
+                "ALL_BLANK_AVERAGE_COLUMN" if bAverage else "ALL_BLANK_SUM_COLUMN",
+                pszInputPath,
+                pszOutputPath,
+                pszProcessMonth,
+                pszGroupNumber,
+                pszGroupName,
+                str(iColumnIndex + 1)
+                + "("
+                + get_column_letter(iColumnIndex + 1)
+                + ") "
+                + arrHeader[iColumnIndex],
+                "column contains no numeric values.",
+                "empty" if bAverage else "0",
+            )
+        elif iColumnIndex in SIMPLE_AVERAGE_COLUMN_INDEXES:
+            objAverage = sum(arrValues, Decimal("0")) / Decimal(len(arrValues))
+            arrOutput[iColumnIndex] = format(
+                objAverage.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ".2f"
+            )
+        else:
+            arrOutput[iColumnIndex] = format_sum_value(
+                sum(arrValues, Decimal("0"))
+            )
+
+    arrShippingCounts: List[Decimal] = dicColumnValues[
+        SHIPPING_COUNT_COLUMN_INDEX
+    ]
+    objShippingCountTotal: Decimal = sum(
+        arrShippingCounts, Decimal("0")
+    )
+    if not arrShippingCounts:
+        arrOutput[AVERAGE_WEIGHT_COLUMN_INDEX] = ""
+    elif objShippingCountTotal == 0:
+        arrOutput[AVERAGE_WEIGHT_COLUMN_INDEX] = ""
+        add_warning(
+            arrWarnings,
+            "AVERAGE_WEIGHT_DIVISION_BY_ZERO",
+            pszInputPath,
+            pszOutputPath,
+            pszProcessMonth,
+            pszGroupNumber,
+            pszGroupName,
+            "4(D) 平均体重, 19(S) 出荷羽数, 21(U) 出荷重量",
+            "shipping count total is zero; average weight cannot be calculated.",
+            "empty",
+        )
+    else:
+        objShippingWeightTotal: Decimal = sum(
+            dicColumnValues[SHIPPING_WEIGHT_COLUMN_INDEX], Decimal("0")
+        )
+        objAverageWeight: Decimal = (
+            objShippingWeightTotal / objShippingCountTotal
+        )
+        arrOutput[AVERAGE_WEIGHT_COLUMN_INDEX] = format(
+            objAverageWeight.quantize(
+                Decimal("0.00001"), rounding=ROUND_HALF_UP
+            ),
+            ".5f",
+        )
+    write_step0002_tsv(pszOutputPath, "\t".join(arrHeader), ["\t".join(arrOutput)])
+
+
+def format_step0002_total_warning(iIndex: int, dicWarning: Dict[str, str]) -> str:
+    pszText: str = "\r\n[警告 " + str(iIndex) + "]\r\n"
+    for pszLabel, pszKey in [
+        ("警告種別", "type"), ("入力step0001", "input"),
+        ("出力step0002", "output"), ("処理年月", "month"),
+        ("グループ№", "group_number"), ("グループ名", "group_name"),
+        ("対象列", "columns"), ("警告理由", "reason"), ("出力値", "output_value"),
+    ]:
+        pszText += pszLabel + ": " + dicWarning[pszKey] + "\r\n"
+    return pszText
+
+
+def write_step0002_total_warnings(
+    pszInputExcelPath: str,
+    pszExistingWarningPath: str,
+    iExistingWarningCount: int,
+    arrWarnings: List[Dict[str, str]],
+) -> str:
+    if not arrWarnings:
+        return pszExistingWarningPath
+    iTotalWarningCount: int = iExistingWarningCount + len(arrWarnings)
+    if pszExistingWarningPath:
+        pszTemporaryPath: str = ""
+        try:
+            with open(
+                pszExistingWarningPath, "r", encoding="utf-8", newline=""
+            ) as objFile:
+                pszExistingText: str = objFile.read()
+            objCountMatch = re.search(r"警告件数: (\d+)", pszExistingText)
+            if objCountMatch is None:
+                raise_conversion_error(
+                    "WARNING_FILE_UPDATE_FAILED",
+                    "warning count was not found in existing warning file. Path = "
+                    + pszExistingWarningPath,
+                )
+            pszExistingText = (
+                pszExistingText[: objCountMatch.start()]
+                + "警告件数: "
+                + str(iTotalWarningCount)
+                + pszExistingText[objCountMatch.end() :]
+            )
+            for iIndex, dicWarning in enumerate(
+                arrWarnings, start=iExistingWarningCount + 1
+            ):
+                pszExistingText += format_step0002_total_warning(iIndex, dicWarning)
+            iFileDescriptor, pszTemporaryPath = tempfile.mkstemp(
+                prefix="group_shipment_summary_warning_",
+                suffix=".txt",
+                dir=os.path.dirname(pszExistingWarningPath),
+            )
+            os.close(iFileDescriptor)
+            with open(
+                pszTemporaryPath, "w", encoding="utf-8", newline=""
+            ) as objFile:
+                objFile.write(pszExistingText)
+            os.replace(pszTemporaryPath, pszExistingWarningPath)
+            pszTemporaryPath = ""
+            return pszExistingWarningPath
+        except ConversionError:
+            raise
+        except Exception as objException:
+            raise_conversion_error(
+                "WARNING_FILE_UPDATE_FAILED",
+                "failed to update warning file. Detail = " + str(objException),
+            )
+        finally:
+            if pszTemporaryPath and os.path.exists(pszTemporaryPath):
+                os.remove(pszTemporaryPath)
+
+    pszWarningPath: str = create_warning_path(pszInputExcelPath)
+    try:
+        with open(pszWarningPath, "x", encoding="utf-8", newline="") as objFile:
+            objFile.write("月次・総計集計が警告付きで完了しました。\r\n")
+            objFile.write("入力Excel: " + pszInputExcelPath + "\r\n")
+            objFile.write("警告件数: " + str(len(arrWarnings)) + "\r\n")
+            for iIndex, dicWarning in enumerate(arrWarnings, start=1):
+                objFile.write(format_step0002_total_warning(iIndex, dicWarning))
+        return pszWarningPath
+    except Exception as objException:
+        if os.path.exists(pszWarningPath):
+            os.remove(pszWarningPath)
+        raise_conversion_error(
+            "WARNING_FILE_CREATE_FAILED",
+            "failed to create total warning file. Detail = "
+            + str(objException),
+        )
+
+
+def create_step0002_total_files(
+    arrStep0001Paths: List[str],
+    pszInputExcelPath: str,
+    pszExistingWarningPath: str,
+    iExistingWarningCount: int,
+) -> Tuple[List[str], str, int]:
+    """グループ別出力と独立して、全対象月の総計TSVを作成します。"""
+    arrCreatedPaths: List[str] = []
+    arrWarnings: List[Dict[str, str]] = []
+    try:
+        for pszStep0001Path in arrStep0001Paths:
+            pszOutputPath: str = create_step0002_total_output_path(pszStep0001Path)
+            aggregate_step0001_total(pszStep0001Path, pszOutputPath, arrWarnings)
+            arrCreatedPaths.append(pszOutputPath)
+        pszWarningPath: str = write_step0002_total_warnings(
+            pszInputExcelPath, pszExistingWarningPath, iExistingWarningCount, arrWarnings
+        )
+        return arrCreatedPaths, pszWarningPath, iExistingWarningCount + len(arrWarnings)
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0002_TOTAL_CLEANUP_FAILED",
+                "step0002 total aggregation failed. Original error = "
+                + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def parse_step0002_file_name(pszStep0002Path: str) -> Tuple[str, int, int, str]:
+    pszFileName: str = os.path.basename(pszStep0002Path)
+    objMatch = re.fullmatch(
+        r"(.+)_step0002_グループ別_(\d{4})_(\d{2})(_\d+)?\.tsv", pszFileName
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0002_FILE_NAME",
+            "invalid step0002 file name. Path = " + pszStep0002Path,
+        )
+    iYear: int = int(objMatch.group(2))
+    iMonth: int = int(objMatch.group(3))
+    if iMonth < 1 or iMonth > 12:
+        raise_conversion_error(
+            "INVALID_STEP0002_FILE_NAME",
+            "invalid month in step0002 file name. Path = " + pszStep0002Path,
+        )
+    return objMatch.group(1), iYear, iMonth, objMatch.group(4) or ""
+
+
+def create_step0003_output_path(pszStep0002Path: str, pszItemName: str) -> str:
+    pszBaseName, iYear, iMonth, pszExistingSuffix = parse_step0002_file_name(
+        pszStep0002Path
+    )
+    pszDirectory: str = os.path.dirname(pszStep0002Path)
+    pszStem: str = (
+        f"{pszBaseName}_step0003_グループ別_{pszItemName}_{iYear:04d}_{iMonth:02d}"
+        + pszExistingSuffix
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def write_step0003_tsv(
+    pszOutputPath: str, pszHeader: str, arrRows: List[str]
+) -> None:
+    try:
+        write_monthly_tsv(pszOutputPath, pszHeader, arrRows)
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0003_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0003_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0003_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0003_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0003_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def extract_step0003_item_tsv(
+    pszInputPath: str,
+    pszOutputPath: str,
+    pszItemName: str,
+    iSourceColumnIndex: int,
+    pszSourceHeader: str,
+    bAllowBlank: bool,
+) -> Tuple[int, int]:
+    _, iFileYear, iFileMonth, _ = parse_step0002_file_name(pszInputPath)
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0002_READ_FAILED", "failed to read step0002 TSV. Detail = " + str(objException)
+        )
+    if not arrLines:
+        raise_conversion_error("STEP0002_HEADER_MISSING", "step0002 header was missing.")
+    arrHeader: List[str] = arrLines[0].split("\t")
+    if len(arrHeader) != 64:
+        raise_conversion_error(
+            "INVALID_STEP0002_COLUMN_COUNT",
+            "step0002 header must contain 64 columns. Actual = " + str(len(arrHeader)),
+        )
+    dicRequiredHeaders: Dict[int, str] = {
+        0: "年",
+        1: "月",
+        10: "ｸﾞﾙｰﾌﾟ№",
+        11: "ｸﾞﾙｰﾌﾟ名",
+        iSourceColumnIndex: pszSourceHeader,
+    }
+    for iColumnIndex, pszExpectedHeader in dicRequiredHeaders.items():
+        if arrHeader[iColumnIndex].strip(" \u3000\t") != pszExpectedHeader:
+            raise_conversion_error(
+                "INVALID_STEP0002_HEADER",
+                "unexpected step0002 header. Column = "
+                + str(iColumnIndex + 1)
+                + ", Expected = "
+                + pszExpectedHeader
+                + ", Actual = "
+                + arrHeader[iColumnIndex],
+            )
+    if len(arrLines) != 4:
+        raise_conversion_error(
+            "INVALID_STEP0002_ROW_COUNT",
+            "step0002 must contain one header and three data rows. Actual rows = "
+            + str(len(arrLines)),
+        )
+
+    arrOutputRows: List[str] = []
+    for iGroupIndex, (pszExpectedNumber, pszExpectedName) in enumerate(GROUPS, start=1):
+        iLineNumber: int = iGroupIndex + 1
+        arrFields: List[str] = arrLines[iGroupIndex].split("\t")
+        if len(arrFields) != 64:
+            raise_conversion_error(
+                "INVALID_STEP0002_COLUMN_COUNT",
+                "step0002 row must contain 64 columns. Line = "
+                + str(iLineNumber)
+                + ", Actual = "
+                + str(len(arrFields)),
+            )
+        iYear, iMonth = parse_year_month(arrFields[0], arrFields[1], iLineNumber)
+        if (iYear, iMonth) != (iFileYear, iFileMonth):
+            raise_conversion_error(
+                "STEP0002_YEAR_MONTH_MISMATCH",
+                "step0002 file name and row year/month do not match. Line = "
+                + str(iLineNumber),
+            )
+        pszGroupNumber: str = arrFields[10].strip(" \u3000\t")
+        pszGroupName: str = arrFields[11].strip(" \u3000\t")
+        if (pszGroupNumber, pszGroupName) != (pszExpectedNumber, pszExpectedName):
+            raise_conversion_error(
+                "INVALID_STEP0002_GROUP_ORDER",
+                "unexpected group order or mapping. Line = " + str(iLineNumber),
+            )
+        try:
+            objItemValue = parse_decimal_value(
+                arrFields[iSourceColumnIndex],
+                iLineNumber,
+                iSourceColumnIndex,
+                arrHeader[iSourceColumnIndex],
+            )
+        except ConversionError as objException:
+            raise_conversion_error(
+                "INVALID_STEP0003_ITEM_VALUE",
+                "invalid step0003 item value. Item = "
+                + pszItemName
+                + ". Detail = "
+                + str(objException),
+            )
+        if objItemValue is None and not bAllowBlank:
+            raise_conversion_error(
+                "INVALID_STEP0003_ITEM_VALUE",
+                "step0003 item value was blank. Item = "
+                + pszItemName
+                + ", Line = "
+                + str(iLineNumber),
+            )
+        arrOutputRows.append(
+            "\t".join(
+                [
+                    arrFields[0],
+                    arrFields[1],
+                    arrFields[10],
+                    arrFields[11],
+                    arrFields[iSourceColumnIndex],
+                ]
+            )
+        )
+    arrOutputHeader: List[str] = [
+        arrHeader[0],
+        arrHeader[1],
+        arrHeader[10],
+        arrHeader[11],
+        pszItemName,
+    ]
+    write_step0003_tsv(pszOutputPath, "\t".join(arrOutputHeader), arrOutputRows)
+    return iFileYear, iFileMonth
+
+
+def create_step0003_files(
+    arrStep0002Paths: List[str], iLatestYear: int
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    setTargetYears = set(range(iLatestYear - 4, iLatestYear + 1))
+    arrTargets: List[Tuple[int, int, str]] = []
+    for pszStep0002Path in arrStep0002Paths:
+        _, iYear, iMonth, _ = parse_step0002_file_name(pszStep0002Path)
+        if iYear in setTargetYears:
+            arrTargets.append((iYear, iMonth, pszStep0002Path))
+    arrTargets.sort()
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for iExpectedYear, iExpectedMonth, pszStep0002Path in arrTargets:
+            for (
+                pszItemName,
+                iSourceColumnIndex,
+                pszSourceHeader,
+                bAllowBlank,
+            ) in STEP0003_ITEMS:
+                pszStep0003Path: str = create_step0003_output_path(
+                    pszStep0002Path, pszItemName
+                )
+                try:
+                    iYear, iMonth = extract_step0003_item_tsv(
+                        pszStep0002Path,
+                        pszStep0003Path,
+                        pszItemName,
+                        iSourceColumnIndex,
+                        pszSourceHeader,
+                        bAllowBlank,
+                    )
+                except ConversionError as objException:
+                    raise_conversion_error(
+                        objException.pszErrorCode,
+                        "step0003 extraction failed. Input step0002 = "
+                        + pszStep0002Path
+                        + ", Target year/month = "
+                        + f"{iExpectedYear:04d}_{iExpectedMonth:02d}"
+                        + ", Item = "
+                        + pszItemName
+                        + ". Detail = "
+                        + str(objException),
+                    )
+                if (iYear, iMonth) != (iExpectedYear, iExpectedMonth):
+                    raise_conversion_error(
+                        "STEP0002_YEAR_MONTH_MISMATCH",
+                        "unexpected year/month returned for step0002. Path = "
+                        + pszStep0002Path,
+                    )
+                arrCreatedPaths.append(pszStep0003Path)
+            arrYearMonths.append((iExpectedYear, iExpectedMonth))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0003_CLEANUP_FAILED",
+                "step0003 extraction failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def parse_step0002_total_file_name(pszStep0002Path: str) -> Tuple[str, int, int, str]:
+    pszFileName: str = os.path.basename(pszStep0002Path)
+    objMatch = re.fullmatch(
+        r"(.+)_step0002_総計_(\d{4})_(\d{2})(_\d+)?\.tsv", pszFileName
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0002_FILE_NAME",
+            "invalid step0002 total file name. Path = " + pszStep0002Path,
+        )
+    iYear: int = int(objMatch.group(2))
+    iMonth: int = int(objMatch.group(3))
+    if iMonth < 1 or iMonth > 12:
+        raise_conversion_error(
+            "INVALID_STEP0002_FILE_NAME",
+            "invalid month in step0002 file name. Path = " + pszStep0002Path,
+        )
+    return objMatch.group(1), iYear, iMonth, objMatch.group(4) or ""
+
+
+def create_step0003_total_output_path(pszStep0002Path: str, pszItemName: str) -> str:
+    pszBaseName, iYear, iMonth, pszExistingSuffix = parse_step0002_total_file_name(
+        pszStep0002Path
+    )
+    pszDirectory: str = os.path.dirname(pszStep0002Path)
+    pszStem: str = (
+        f"{pszBaseName}_step0003_総計_{pszItemName}_{iYear:04d}_{iMonth:02d}"
+        + pszExistingSuffix
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def extract_step0003_total_item_tsv(
+    pszInputPath: str,
+    pszOutputPath: str,
+    pszItemName: str,
+    iSourceColumnIndex: int,
+    pszSourceHeader: str,
+    bAllowBlank: bool,
+) -> Tuple[int, int]:
+    """step0002総計の値を再計算せず、1項目の総計TSVへ抽出します。"""
+    _, iFileYear, iFileMonth, _ = parse_step0002_total_file_name(pszInputPath)
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0002_READ_FAILED", "failed to read step0002 TSV. Detail = " + str(objException)
+        )
+    if not arrLines:
+        raise_conversion_error("STEP0002_HEADER_MISSING", "step0002 header was missing.")
+    arrHeader: List[str] = arrLines[0].split("\t")
+    if len(arrHeader) != 64:
+        raise_conversion_error(
+            "INVALID_STEP0002_COLUMN_COUNT",
+            "step0002 header must contain 64 columns. Actual = " + str(len(arrHeader)),
+        )
+    dicRequiredHeaders: Dict[int, str] = {
+        0: "年",
+        1: "月",
+        10: "ｸﾞﾙｰﾌﾟ№",
+        11: "ｸﾞﾙｰﾌﾟ名",
+        iSourceColumnIndex: pszSourceHeader,
+    }
+    for iColumnIndex, pszExpectedHeader in dicRequiredHeaders.items():
+        if arrHeader[iColumnIndex].strip(" \u3000\t") != pszExpectedHeader:
+            raise_conversion_error(
+                "INVALID_STEP0002_HEADER",
+                "unexpected step0002 header. Column = "
+                + str(iColumnIndex + 1)
+                + ", Expected = "
+                + pszExpectedHeader
+                + ", Actual = "
+                + arrHeader[iColumnIndex],
+            )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0002_ROW_COUNT",
+            "step0002 must contain one header and one total data row. Actual rows = "
+            + str(len(arrLines)),
+        )
+
+    arrOutputRows: List[str] = []
+    for iGroupIndex, (pszExpectedNumber, pszExpectedName) in enumerate([("", "総計")], start=1):
+        iLineNumber: int = iGroupIndex + 1
+        arrFields: List[str] = arrLines[iGroupIndex].split("\t")
+        if len(arrFields) != 64:
+            raise_conversion_error(
+                "INVALID_STEP0002_COLUMN_COUNT",
+                "step0002 row must contain 64 columns. Line = "
+                + str(iLineNumber)
+                + ", Actual = "
+                + str(len(arrFields)),
+            )
+        iYear, iMonth = parse_year_month(arrFields[0], arrFields[1], iLineNumber)
+        if (iYear, iMonth) != (iFileYear, iFileMonth):
+            raise_conversion_error(
+                "STEP0002_YEAR_MONTH_MISMATCH",
+                "step0002 file name and row year/month do not match. Line = "
+                + str(iLineNumber),
+            )
+        pszGroupNumber: str = arrFields[10].strip(" \u3000\t")
+        pszGroupName: str = arrFields[11].strip(" \u3000\t")
+        if (pszGroupNumber, pszGroupName) != (pszExpectedNumber, pszExpectedName):
+            raise_conversion_error(
+                "INVALID_STEP0002_GROUP_ORDER",
+                "expected an empty group number and total group name. Line = " + str(iLineNumber),
+            )
+        try:
+            objItemValue = parse_decimal_value(
+                arrFields[iSourceColumnIndex],
+                iLineNumber,
+                iSourceColumnIndex,
+                arrHeader[iSourceColumnIndex],
+            )
+        except ConversionError as objException:
+            raise_conversion_error(
+                "INVALID_STEP0003_ITEM_VALUE",
+                "invalid step0003 item value. Item = "
+                + pszItemName
+                + ". Detail = "
+                + str(objException),
+            )
+        if objItemValue is None and not bAllowBlank:
+            raise_conversion_error(
+                "INVALID_STEP0003_ITEM_VALUE",
+                "step0003 item value was blank. Item = "
+                + pszItemName
+                + ", Line = "
+                + str(iLineNumber),
+            )
+        arrOutputRows.append(
+            "\t".join(
+                [
+                    arrFields[0],
+                    arrFields[1],
+                    arrFields[10],
+                    arrFields[11],
+                    arrFields[iSourceColumnIndex],
+                ]
+            )
+        )
+    arrOutputHeader: List[str] = [
+        arrHeader[0],
+        arrHeader[1],
+        arrHeader[10],
+        arrHeader[11],
+        pszItemName,
+    ]
+    write_step0003_tsv(pszOutputPath, "\t".join(arrOutputHeader), arrOutputRows)
+    return iFileYear, iFileMonth
+
+
+def create_step0003_total_files(
+    arrStep0002Paths: List[str], iLatestYear: int
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """直近5年間の総計43項目を、グループ別処理と独立して出力します。"""
+    setTargetYears = set(range(iLatestYear - 4, iLatestYear + 1))
+    arrTargets: List[Tuple[int, int, str]] = []
+    for pszStep0002Path in arrStep0002Paths:
+        _, iYear, iMonth, _ = parse_step0002_total_file_name(pszStep0002Path)
+        if iYear in setTargetYears:
+            arrTargets.append((iYear, iMonth, pszStep0002Path))
+    arrTargets.sort()
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for iExpectedYear, iExpectedMonth, pszStep0002Path in arrTargets:
+            for (
+                pszItemName,
+                iSourceColumnIndex,
+                pszSourceHeader,
+                bAllowBlank,
+            ) in STEP0003_ITEMS:
+                pszStep0003Path: str = create_step0003_total_output_path(
+                    pszStep0002Path, pszItemName
+                )
+                try:
+                    iYear, iMonth = extract_step0003_total_item_tsv(
+                        pszStep0002Path,
+                        pszStep0003Path,
+                        pszItemName,
+                        iSourceColumnIndex,
+                        pszSourceHeader,
+                        bAllowBlank,
+                    )
+                except ConversionError as objException:
+                    raise_conversion_error(
+                        objException.pszErrorCode,
+                        "step0003 total extraction failed. Input step0002 = "
+                        + pszStep0002Path
+                        + ", Target year/month = "
+                        + f"{iExpectedYear:04d}_{iExpectedMonth:02d}"
+                        + ", Item = "
+                        + pszItemName
+                        + ". Detail = "
+                        + str(objException),
+                    )
+                if (iYear, iMonth) != (iExpectedYear, iExpectedMonth):
+                    raise_conversion_error(
+                        "STEP0002_YEAR_MONTH_MISMATCH",
+                        "unexpected year/month returned for step0002. Path = "
+                        + pszStep0002Path,
+                    )
+                arrCreatedPaths.append(pszStep0003Path)
+            arrYearMonths.append((iExpectedYear, iExpectedMonth))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0003_TOTAL_CLEANUP_FAILED",
+                "step0003 total extraction failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+STEP0004_TOTAL_WEIGHT_ITEMS: List[str] = [
+    "マレック重量", "大腸菌症重量", "ブドウ球菌症重量", "敗血症重量",
+    "変性重量", "腹水症重量", "出血重量", "炎症重量", "腫瘍重量",
+    "黄疸重量", "発育不良重量", "放血不良重量",
+    "湯漬過度重量", "異常鶏重量", "予備２重量",
+]
+
+
+def parse_step0003_total_file_name(
+    pszInputPath: str,
+) -> Tuple[str, str, int, int, str]:
+    objMatch = re.fullmatch(
+        r"(.+)_step0003_総計_(.+)_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszInputPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_FILE_NAME",
+            "invalid step0003 total file name. Path = " + pszInputPath,
+        )
+    iYear, iMonth = parse_year_month(objMatch.group(3), objMatch.group(4), 1)
+    return objMatch.group(1), objMatch.group(2), iYear, iMonth, objMatch.group(5)
+
+
+def create_step0004_total_weight_output_path(
+    pszFirstInputPath: str,
+) -> str:
+    pszBaseName, _, iYear, iMonth, pszSuffix = parse_step0003_total_file_name(
+        pszFirstInputPath
+    )
+    pszDirectory: str = os.path.dirname(pszFirstInputPath)
+    pszStem: str = (
+        f"{pszBaseName}_step0004_総計_廃棄データ別_重量_{iYear:04d}_{iMonth:02d}"
+        + pszSuffix
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0003_total_weight_item(
+    pszInputPath: str, pszExpectedItem: str,
+) -> Tuple[List[str], List[str]]:
+    _, pszItemName, iFileYear, iFileMonth, _ = parse_step0003_total_file_name(
+        pszInputPath
+    )
+    if pszItemName != pszExpectedItem:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ITEM", "unexpected item. Path = " + pszInputPath,
+        )
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0003_TOTAL_READ_FAILED",
+            "failed to read step0003 total TSV. Path = " + pszInputPath
+            + "; Detail = " + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ROW_COUNT",
+            "step0003 total TSV must contain one header and one data row. Path = "
+            + pszInputPath,
+        )
+    arrHeader = arrLines[0].split("\t")
+    arrFields = arrLines[1].split("\t")
+    if len(arrHeader) != 5 or len(arrFields) != 5:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_COLUMN_COUNT",
+            "step0003 total TSV must contain five columns. Path = " + pszInputPath,
+        )
+    if arrHeader != ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", pszExpectedItem]:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_HEADER",
+            "unexpected step0003 total header. Path = " + pszInputPath,
+        )
+    if parse_year_month(arrFields[0], arrFields[1], 2) != (iFileYear, iFileMonth):
+        raise_conversion_error(
+            "STEP0003_TOTAL_YEAR_MONTH_MISMATCH",
+            "file name and data year/month do not match. Path = " + pszInputPath,
+        )
+    if arrFields[2:4] != ["", "総計"]:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_GROUP",
+            "expected an empty group number and total group name. Path = " + pszInputPath,
+        )
+    if parse_decimal_value(arrFields[4], 2, 4, pszExpectedItem) is None:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ITEM_VALUE",
+            "total weight item was blank. Path = " + pszInputPath,
+        )
+    return arrHeader, arrFields
+
+
+def create_step0004_total_weight_files(
+    arrStep0003TotalPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """各年月の総計重量15項目を指定順に横結合し、数値表記を保持します。"""
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszInputPath in arrStep0003TotalPaths:
+        pszBaseName, pszItemName, iYear, iMonth, pszSuffix = (
+            parse_step0003_total_file_name(pszInputPath)
+        )
+        objKey = (os.path.dirname(os.path.abspath(pszInputPath)),
+                  pszBaseName, iYear, iMonth, pszSuffix)
+        dicItems = dicInputs.setdefault(objKey, {})
+        if pszItemName not in STEP0004_TOTAL_WEIGHT_ITEMS:
+            continue
+        if pszItemName in dicItems:
+            raise_conversion_error(
+                "DUPLICATE_STEP0003_TOTAL_WEIGHT_ITEM",
+                "duplicate total weight item. Path = " + pszInputPath,
+            )
+        dicItems[pszItemName] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicItems = dicInputs[objKey]
+            arrMissing = [pszItem for pszItem in STEP0004_TOTAL_WEIGHT_ITEMS
+                          if pszItem not in dicItems]
+            if arrMissing:
+                raise_conversion_error(
+                    "MISSING_STEP0003_TOTAL_WEIGHT_ITEMS",
+                    "missing total weight items for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}: "
+                    + ", ".join(arrMissing),
+                )
+            arrOutputHeader: List[str] = []
+            arrOutputFields: List[str] = []
+            for pszItem in STEP0004_TOTAL_WEIGHT_ITEMS:
+                arrHeader, arrFields = read_step0003_total_weight_item(
+                    dicItems[pszItem], pszItem
+                )
+                if not arrOutputFields:
+                    arrOutputHeader = arrHeader[:4]
+                    arrOutputFields = arrFields[:4]
+                elif arrFields[:4] != arrOutputFields[:4]:
+                    raise_conversion_error(
+                        "STEP0003_TOTAL_COMMON_COLUMNS_MISMATCH",
+                        "common columns do not match. Path = " + dicItems[pszItem],
+                    )
+                arrOutputHeader.append(arrHeader[4])
+                arrOutputFields.append(arrFields[4])
+            pszOutputPath = create_step0004_total_weight_output_path(
+                dicItems[STEP0004_TOTAL_WEIGHT_ITEMS[0]]
+            )
+            write_step0004_tsv(
+                pszOutputPath, "\t".join(arrOutputHeader), "\t".join(arrOutputFields)
+            )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0004_TOTAL_WEIGHT_CLEANUP_FAILED",
+                "total weight combination failed. Original error = " + str(objException)
+                + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+STEP0004_TOTAL_COUNT_ITEMS: List[str] = [
+    "マレック羽数", "大腸菌症羽数", "ブドウ球菌症羽数", "敗血症羽数",
+    "変性羽数", "腹水症羽数", "出血羽数", "炎症羽数", "腫瘍羽数",
+    "黄疸羽数", "発育不良羽数", "懸鳥前発育不良羽数", "放血不良羽数",
+    "湯漬過度羽数", "異常鶏羽数", "予備２羽数",
+]
+
+
+def create_step0004_total_count_output_path(
+    pszFirstInputPath: str,
+) -> str:
+    pszBaseName, _, iYear, iMonth, pszSuffix = parse_step0003_total_file_name(
+        pszFirstInputPath
+    )
+    pszDirectory: str = os.path.dirname(pszFirstInputPath)
+    pszStem: str = (
+        f"{pszBaseName}_step0004_総計_廃棄データ別_羽数_{iYear:04d}_{iMonth:02d}"
+        + pszSuffix
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0003_total_count_item(
+    pszInputPath: str, pszExpectedItem: str,
+) -> Tuple[List[str], List[str]]:
+    _, pszItemName, iFileYear, iFileMonth, _ = parse_step0003_total_file_name(
+        pszInputPath
+    )
+    if pszItemName != pszExpectedItem:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ITEM", "unexpected item. Path = " + pszInputPath,
+        )
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0003_TOTAL_READ_FAILED",
+            "failed to read step0003 total TSV. Path = " + pszInputPath
+            + "; Detail = " + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ROW_COUNT",
+            "step0003 total TSV must contain one header and one data row. Path = "
+            + pszInputPath,
+        )
+    arrHeader = arrLines[0].split("\t")
+    arrFields = arrLines[1].split("\t")
+    if len(arrHeader) != 5 or len(arrFields) != 5:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_COLUMN_COUNT",
+            "step0003 total TSV must contain five columns. Path = " + pszInputPath,
+        )
+    if arrHeader != ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", pszExpectedItem]:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_HEADER",
+            "unexpected step0003 total header. Path = " + pszInputPath,
+        )
+    if parse_year_month(arrFields[0], arrFields[1], 2) != (iFileYear, iFileMonth):
+        raise_conversion_error(
+            "STEP0003_TOTAL_YEAR_MONTH_MISMATCH",
+            "file name and data year/month do not match. Path = " + pszInputPath,
+        )
+    if arrFields[2:4] != ["", "総計"]:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_GROUP",
+            "expected an empty group number and total group name. Path = " + pszInputPath,
+        )
+    if parse_decimal_value(arrFields[4], 2, 4, pszExpectedItem) is None:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ITEM_VALUE",
+            "total count item was blank. Path = " + pszInputPath,
+        )
+    return arrHeader, arrFields
+
+
+def create_step0004_total_count_files(
+    arrStep0003TotalPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """各年月の総計羽数16項目を指定順に横結合し、数値表記を保持します。"""
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszInputPath in arrStep0003TotalPaths:
+        pszBaseName, pszItemName, iYear, iMonth, pszSuffix = (
+            parse_step0003_total_file_name(pszInputPath)
+        )
+        objKey = (os.path.dirname(os.path.abspath(pszInputPath)),
+                  pszBaseName, iYear, iMonth, pszSuffix)
+        dicItems = dicInputs.setdefault(objKey, {})
+        if pszItemName not in STEP0004_TOTAL_COUNT_ITEMS:
+            continue
+        if pszItemName in dicItems:
+            raise_conversion_error(
+                "DUPLICATE_STEP0003_TOTAL_COUNT_ITEM",
+                "duplicate total count item. Path = " + pszInputPath,
+            )
+        dicItems[pszItemName] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicItems = dicInputs[objKey]
+            arrMissing = [pszItem for pszItem in STEP0004_TOTAL_COUNT_ITEMS
+                          if pszItem not in dicItems]
+            if arrMissing:
+                raise_conversion_error(
+                    "MISSING_STEP0003_TOTAL_COUNT_ITEMS",
+                    "missing total count items for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}: "
+                    + ", ".join(arrMissing),
+                )
+            arrOutputHeader: List[str] = []
+            arrOutputFields: List[str] = []
+            for pszItem in STEP0004_TOTAL_COUNT_ITEMS:
+                arrHeader, arrFields = read_step0003_total_count_item(
+                    dicItems[pszItem], pszItem
+                )
+                if not arrOutputFields:
+                    arrOutputHeader = arrHeader[:4]
+                    arrOutputFields = arrFields[:4]
+                elif arrFields[:4] != arrOutputFields[:4]:
+                    raise_conversion_error(
+                        "STEP0003_TOTAL_COMMON_COLUMNS_MISMATCH",
+                        "common columns do not match. Path = " + dicItems[pszItem],
+                    )
+                arrOutputHeader.append(arrHeader[4])
+                arrOutputFields.append(arrFields[4])
+            pszOutputPath = create_step0004_total_count_output_path(
+                dicItems[STEP0004_TOTAL_COUNT_ITEMS[0]]
+            )
+            write_step0004_tsv(
+                pszOutputPath, "\t".join(arrOutputHeader), "\t".join(arrOutputFields)
+            )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0004_TOTAL_COUNT_CLEANUP_FAILED",
+                "total count combination failed. Original error = " + str(objException)
+                + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS: List[str] = [
+    "懸鳥前死鶏羽数", "懸鳥前発育不良羽数",
+]
+
+
+def create_step0004_total_pre_slaughter_count_output_path(
+    pszFirstInputPath: str,
+) -> str:
+    pszBaseName, _, iYear, iMonth, pszSuffix = parse_step0003_total_file_name(
+        pszFirstInputPath
+    )
+    pszDirectory: str = os.path.dirname(pszFirstInputPath)
+    pszStem: str = (
+        f"{pszBaseName}_step0004_総計_懸鳥前データ別_羽数_{iYear:04d}_{iMonth:02d}"
+        + pszSuffix
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0004_total_pre_slaughter_count_files(
+    arrStep0003TotalPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """各年月の懸鳥前総計羽数2項目を指定順に横結合し、数値表記を保持します。"""
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszInputPath in arrStep0003TotalPaths:
+        pszBaseName, pszItemName, iYear, iMonth, pszSuffix = (
+            parse_step0003_total_file_name(pszInputPath)
+        )
+        objKey = (os.path.dirname(os.path.abspath(pszInputPath)),
+                  pszBaseName, iYear, iMonth, pszSuffix)
+        dicItems = dicInputs.setdefault(objKey, {})
+        if pszItemName not in STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS:
+            continue
+        if pszItemName in dicItems:
+            raise_conversion_error(
+                "DUPLICATE_STEP0003_TOTAL_PRE_SLAUGHTER_COUNT_ITEM",
+                "duplicate pre-slaughter total count item. Path = " + pszInputPath,
+            )
+        dicItems[pszItemName] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicItems = dicInputs[objKey]
+            arrMissing = [pszItem for pszItem in STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS
+                          if pszItem not in dicItems]
+            if arrMissing:
+                raise_conversion_error(
+                    "MISSING_STEP0003_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS",
+                    "missing pre-slaughter total count items for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}: "
+                    + ", ".join(arrMissing),
+                )
+            arrOutputHeader: List[str] = []
+            arrOutputFields: List[str] = []
+            for pszItem in STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS:
+                arrHeader, arrFields = read_step0003_total_count_item(
+                    dicItems[pszItem], pszItem
+                )
+                if not arrOutputFields:
+                    arrOutputHeader = arrHeader[:4]
+                    arrOutputFields = arrFields[:4]
+                elif arrFields[:4] != arrOutputFields[:4]:
+                    raise_conversion_error(
+                        "STEP0003_TOTAL_COMMON_COLUMNS_MISMATCH",
+                        "common columns do not match. Path = " + dicItems[pszItem],
+                    )
+                arrOutputHeader.append(arrHeader[4])
+                arrOutputFields.append(arrFields[4])
+            pszOutputPath = create_step0004_total_pre_slaughter_count_output_path(
+                dicItems[STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS[0]]
+            )
+            write_step0004_tsv(
+                pszOutputPath, "\t".join(arrOutputHeader), "\t".join(arrOutputFields)
+            )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_CLEANUP_FAILED",
+                "pre-slaughter total count combination failed. Original error = " + str(objException)
+                + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS: List[str] = [
+    "懸鳥前死鶏重量",
+]
+
+
+def create_step0004_total_pre_slaughter_weight_output_path(
+    pszFirstInputPath: str,
+) -> str:
+    pszBaseName, _, iYear, iMonth, pszSuffix = parse_step0003_total_file_name(
+        pszFirstInputPath
+    )
+    pszDirectory: str = os.path.dirname(pszFirstInputPath)
+    pszStem: str = (
+        f"{pszBaseName}_step0004_総計_懸鳥前データ別_重量_{iYear:04d}_{iMonth:02d}"
+        + pszSuffix
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0004_total_pre_slaughter_weight_files(
+    arrStep0003TotalPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """各年月の懸鳥前総計重量を指定順に横結合し、数値表記を保持します。"""
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszInputPath in arrStep0003TotalPaths:
+        pszBaseName, pszItemName, iYear, iMonth, pszSuffix = (
+            parse_step0003_total_file_name(pszInputPath)
+        )
+        objKey = (os.path.dirname(os.path.abspath(pszInputPath)),
+                  pszBaseName, iYear, iMonth, pszSuffix)
+        dicItems = dicInputs.setdefault(objKey, {})
+        if pszItemName not in STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS:
+            continue
+        if pszItemName in dicItems:
+            raise_conversion_error(
+                "DUPLICATE_STEP0003_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEM",
+                "duplicate pre-slaughter total weight item. Path = " + pszInputPath,
+            )
+        dicItems[pszItemName] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicItems = dicInputs[objKey]
+            arrMissing = [pszItem for pszItem in STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS
+                          if pszItem not in dicItems]
+            if arrMissing:
+                raise_conversion_error(
+                    "MISSING_STEP0003_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS",
+                    "missing pre-slaughter total weight items for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}: "
+                    + ", ".join(arrMissing),
+                )
+            arrOutputHeader: List[str] = []
+            arrOutputFields: List[str] = []
+            for pszItem in STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS:
+                arrHeader, arrFields = read_step0003_total_weight_item(
+                    dicItems[pszItem], pszItem
+                )
+                if not arrOutputFields:
+                    arrOutputHeader = arrHeader[:4]
+                    arrOutputFields = arrFields[:4]
+                elif arrFields[:4] != arrOutputFields[:4]:
+                    raise_conversion_error(
+                        "STEP0003_TOTAL_COMMON_COLUMNS_MISMATCH",
+                        "common columns do not match. Path = " + dicItems[pszItem],
+                    )
+                arrOutputHeader.append(arrHeader[4])
+                arrOutputFields.append(arrFields[4])
+            pszOutputPath = create_step0004_total_pre_slaughter_weight_output_path(
+                dicItems[STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS[0]]
+            )
+            write_step0004_tsv(
+                pszOutputPath, "\t".join(arrOutputHeader), "\t".join(arrOutputFields)
+            )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_CLEANUP_FAILED",
+                "pre-slaughter total weight combination failed. Original error = " + str(objException)
+                + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def parse_step0004_pre_slaughter_file_name(
+    pszInputPath: str,
+) -> Tuple[str, str, int, int, str]:
+    objMatch = re.fullmatch(
+        r"(.+)_step0004_総計_懸鳥前データ別_(羽数|重量)_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszInputPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0004_PRE_SLAUGHTER_FILE_NAME",
+            "invalid pre-slaughter step0004 file name. Path = " + pszInputPath,
+        )
+    iYear, iMonth = parse_year_month(objMatch.group(3), objMatch.group(4), 1)
+    return objMatch.group(1), objMatch.group(2), iYear, iMonth, objMatch.group(5)
+
+
+def read_step0004_pre_slaughter_subtotal_input(
+    pszInputPath: str,
+) -> Tuple[List[str], List[str], Decimal]:
+    _, pszKind, iFileYear, iFileMonth, _ = parse_step0004_pre_slaughter_file_name(
+        pszInputPath
+    )
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0004_PRE_SLAUGHTER_READ_FAILED",
+            "failed to read pre-slaughter step0004. Path = " + pszInputPath
+            + "; Detail = " + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0004_PRE_SLAUGHTER_ROW_COUNT",
+            "pre-slaughter step0004 must contain one header and one total row. Path = "
+            + pszInputPath,
+        )
+    arrHeader = arrLines[0].split("\t")
+    arrFields = arrLines[1].split("\t")
+    arrExpectedHeader = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名"]
+        + (["懸鳥前死鶏" + pszKind, "懸鳥前発育不良" + pszKind]
+           if pszKind == "羽数" else ["懸鳥前死鶏重量"])
+    )
+    if len(arrHeader) != len(arrExpectedHeader) or len(arrFields) != len(arrExpectedHeader):
+        raise_conversion_error(
+            "INVALID_STEP0004_PRE_SLAUGHTER_COLUMN_COUNT",
+            "unexpected pre-slaughter step0004 column count. Path = " + pszInputPath,
+        )
+    if arrHeader != arrExpectedHeader:
+        raise_conversion_error(
+            "INVALID_STEP0004_PRE_SLAUGHTER_HEADER",
+            "unexpected pre-slaughter step0004 header. Path = " + pszInputPath,
+        )
+    if parse_year_month(arrFields[0], arrFields[1], 2) != (iFileYear, iFileMonth):
+        raise_conversion_error(
+            "STEP0004_PRE_SLAUGHTER_YEAR_MONTH_MISMATCH",
+            "file name and row year/month do not match. Path = " + pszInputPath,
+        )
+    if arrFields[2:4] != ["", "総計"]:
+        raise_conversion_error(
+            "INVALID_STEP0004_PRE_SLAUGHTER_GROUP",
+            "expected an empty group number and total group name. Path = " + pszInputPath,
+        )
+    objSubtotal = Decimal("0")
+    for iColumnIndex in range(4, len(arrFields)):
+        objValue = parse_decimal_value(arrFields[iColumnIndex], 2, iColumnIndex,
+                                       arrHeader[iColumnIndex])
+        if objValue is None:
+            raise_conversion_error(
+                "INVALID_PRE_SLAUGHTER_SUBTOTAL_VALUE",
+                "subtotal source value was blank. Path = " + pszInputPath,
+            )
+        objSubtotal += objValue
+    return arrHeader, arrFields, objSubtotal
+
+
+def create_step0005_pre_slaughter_subtotal_output_path(pszInputPath: str) -> str:
+    pszBaseName, pszKind, iYear, iMonth, pszSuffix = (
+        parse_step0004_pre_slaughter_file_name(pszInputPath)
+    )
+    pszDirectory = os.path.dirname(pszInputPath)
+    pszStem = (f"{pszBaseName}_step0005_総計_懸鳥前データ別_{pszKind}_{iYear:04d}_{iMonth:02d}"
+               + pszSuffix)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0005_pre_slaughter_subtotal_files(
+    arrCountPaths: List[str], arrWeightPaths: List[str],
+) -> Tuple[List[str], List[str], List[Tuple[int, int]]]:
+    """懸鳥前の羽数・重量を別々に加算し、入力列を保持して小計列を追加します。"""
+    dicPairs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszExpectedKind, arrPaths in [("羽数", arrCountPaths), ("重量", arrWeightPaths)]:
+        for pszPath in arrPaths:
+            pszBase, pszKind, iYear, iMonth, pszSuffix = (
+                parse_step0004_pre_slaughter_file_name(pszPath)
+            )
+            if pszKind != pszExpectedKind:
+                raise_conversion_error(
+                    "INVALID_PRE_SLAUGHTER_SUBTOTAL_INPUT_KIND",
+                    "unexpected subtotal input kind. Path = " + pszPath,
+                )
+            objKey = (os.path.dirname(os.path.abspath(pszPath)), pszBase,
+                      iYear, iMonth, pszSuffix)
+            dicPair = dicPairs.setdefault(objKey, {})
+            if pszKind in dicPair:
+                raise_conversion_error(
+                    "DUPLICATE_PRE_SLAUGHTER_SUBTOTAL_INPUT",
+                    "duplicate subtotal input. Path = " + pszPath,
+                )
+            dicPair[pszKind] = pszPath
+
+    arrCreatedPaths: List[str] = []
+    arrCountOutputPaths: List[str] = []
+    arrWeightOutputPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicPairs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicPair = dicPairs[objKey]
+            if set(dicPair) != {"羽数", "重量"}:
+                raise_conversion_error(
+                    "MISSING_PRE_SLAUGHTER_SUBTOTAL_INPUT",
+                    "count and weight inputs must be paired for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}",
+                )
+            arrCountHeader, arrCountFields, objCountSubtotal = (
+                read_step0004_pre_slaughter_subtotal_input(dicPair["羽数"])
+            )
+            arrWeightHeader, arrWeightFields, objWeightSubtotal = (
+                read_step0004_pre_slaughter_subtotal_input(dicPair["重量"])
+            )
+            if arrCountFields[:4] != arrWeightFields[:4]:
+                raise_conversion_error(
+                    "PRE_SLAUGHTER_SUBTOTAL_COMMON_COLUMNS_MISMATCH",
+                    "count and weight common columns do not match. Path = " + dicPair["重量"],
+                )
+            pszCountSubtotal = format(Decimal(format_sum_value(objCountSubtotal)), ",f")
+            pszWeightSubtotal = format(
+                objWeightSubtotal.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), ",.1f"
+            )
+            for pszKind, arrHeader, arrFields, pszSubtotal, arrOutputPaths in [
+                ("羽数", arrCountHeader, arrCountFields, pszCountSubtotal, arrCountOutputPaths),
+                ("重量", arrWeightHeader, arrWeightFields, pszWeightSubtotal, arrWeightOutputPaths),
+            ]:
+                pszOutputPath = create_step0005_pre_slaughter_subtotal_output_path(
+                    dicPair[pszKind]
+                )
+                write_step0005_tsv(pszOutputPath, "\t".join(arrHeader + ["小計"]),
+                                   ["\t".join(arrFields + [pszSubtotal])])
+                arrCreatedPaths.append(pszOutputPath)
+                arrOutputPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCountOutputPaths, arrWeightOutputPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "PRE_SLAUGHTER_SUBTOTAL_CLEANUP_FAILED",
+                "pre-slaughter subtotal failed. Original error = " + str(objException)
+                + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def parse_step0004_discard_file_name(
+    pszInputPath: str,
+) -> Tuple[str, str, int, int, str]:
+    objMatch = re.fullmatch(
+        r"(.+)_step0004_総計_廃棄データ別_(羽数|重量)_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszInputPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0004_DISCARD_FILE_NAME",
+            "invalid discard step0004 file name. Path = " + pszInputPath,
+        )
+    iYear, iMonth = parse_year_month(objMatch.group(3), objMatch.group(4), 1)
+    return objMatch.group(1), objMatch.group(2), iYear, iMonth, objMatch.group(5)
+
+
+def read_step0004_discard_subtotal_input(
+    pszInputPath: str,
+) -> Tuple[List[str], List[str], Decimal]:
+    _, pszKind, iFileYear, iFileMonth, _ = parse_step0004_discard_file_name(
+        pszInputPath
+    )
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0004_DISCARD_READ_FAILED",
+            "failed to read discard step0004. Path = " + pszInputPath
+            + "; Detail = " + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0004_DISCARD_ROW_COUNT",
+            "discard step0004 must contain one header and one total row. Path = "
+            + pszInputPath,
+        )
+    arrHeader = arrLines[0].split("\t")
+    arrFields = arrLines[1].split("\t")
+    arrExpectedItems = (STEP0004_TOTAL_COUNT_ITEMS if pszKind == "羽数"
+                        else STEP0004_TOTAL_WEIGHT_ITEMS)
+    iExpectedColumnCount = 4 + len(arrExpectedItems)
+    if len(arrHeader) != iExpectedColumnCount or len(arrFields) != iExpectedColumnCount:
+        raise_conversion_error(
+            "INVALID_STEP0004_DISCARD_COLUMN_COUNT",
+            "unexpected discard step0004 column count. Path = " + pszInputPath,
+        )
+    arrExpectedHeader = ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名"] + arrExpectedItems
+    if arrHeader != arrExpectedHeader:
+        raise_conversion_error(
+            "INVALID_STEP0004_DISCARD_HEADER",
+            "unexpected discard step0004 header. Path = " + pszInputPath,
+        )
+    if parse_year_month(arrFields[0], arrFields[1], 2) != (iFileYear, iFileMonth):
+        raise_conversion_error(
+            "STEP0004_DISCARD_YEAR_MONTH_MISMATCH",
+            "file name and row year/month do not match. Path = " + pszInputPath,
+        )
+    if arrFields[2:4] != ["", "総計"]:
+        raise_conversion_error(
+            "INVALID_STEP0004_DISCARD_GROUP",
+            "expected an empty group number and total group name. Path = " + pszInputPath,
+        )
+    objSubtotal = Decimal("0")
+    for iColumnIndex in range(4, len(arrFields)):
+        objValue = parse_decimal_value(arrFields[iColumnIndex], 2, iColumnIndex,
+                                       arrHeader[iColumnIndex])
+        if objValue is None:
+            raise_conversion_error(
+                "INVALID_DISCARD_SUBTOTAL_VALUE",
+                "subtotal source value was blank. Path = " + pszInputPath,
+            )
+        objSubtotal += objValue
+    return arrHeader, arrFields, objSubtotal
+
+
+def create_step0005_discard_subtotal_output_path(pszInputPath: str) -> str:
+    pszBaseName, pszKind, iYear, iMonth, pszSuffix = (
+        parse_step0004_discard_file_name(pszInputPath)
+    )
+    pszDirectory = os.path.dirname(pszInputPath)
+    pszStem = (f"{pszBaseName}_step0005_総計_廃棄データ別_{pszKind}_{iYear:04d}_{iMonth:02d}"
+               + pszSuffix)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0005_discard_subtotal_files(
+    arrCountPaths: List[str], arrWeightPaths: List[str],
+) -> Tuple[List[str], List[str], List[Tuple[int, int]]]:
+    """予備２を含む羽数16項目・重量15項目を加算し、小計列を追加します。"""
+    dicPairs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszExpectedKind, arrPaths in [("羽数", arrCountPaths), ("重量", arrWeightPaths)]:
+        for pszPath in arrPaths:
+            pszBase, pszKind, iYear, iMonth, pszSuffix = (
+                parse_step0004_discard_file_name(pszPath)
+            )
+            if pszKind != pszExpectedKind:
+                raise_conversion_error(
+                    "INVALID_DISCARD_SUBTOTAL_INPUT_KIND",
+                    "unexpected subtotal input kind. Path = " + pszPath,
+                )
+            objKey = (os.path.dirname(os.path.abspath(pszPath)), pszBase,
+                      iYear, iMonth, pszSuffix)
+            dicPair = dicPairs.setdefault(objKey, {})
+            if pszKind in dicPair:
+                raise_conversion_error(
+                    "DUPLICATE_DISCARD_SUBTOTAL_INPUT",
+                    "duplicate subtotal input. Path = " + pszPath,
+                )
+            dicPair[pszKind] = pszPath
+
+    arrCreatedPaths: List[str] = []
+    arrCountOutputPaths: List[str] = []
+    arrWeightOutputPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicPairs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicPair = dicPairs[objKey]
+            if set(dicPair) != {"羽数", "重量"}:
+                raise_conversion_error(
+                    "MISSING_DISCARD_SUBTOTAL_INPUT",
+                    "count and weight inputs must be paired for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}",
+                )
+            arrCountHeader, arrCountFields, objCountSubtotal = (
+                read_step0004_discard_subtotal_input(dicPair["羽数"])
+            )
+            arrWeightHeader, arrWeightFields, objWeightSubtotal = (
+                read_step0004_discard_subtotal_input(dicPair["重量"])
+            )
+            if arrCountFields[:4] != arrWeightFields[:4]:
+                raise_conversion_error(
+                    "DISCARD_SUBTOTAL_COMMON_COLUMNS_MISMATCH",
+                    "count and weight common columns do not match. Path = " + dicPair["重量"],
+                )
+            pszCountSubtotal = format(Decimal(format_sum_value(objCountSubtotal)), ",f")
+            pszWeightSubtotal = format(
+                objWeightSubtotal.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), ",.1f"
+            )
+            for pszKind, arrHeader, arrFields, pszSubtotal, arrOutputPaths in [
+                ("羽数", arrCountHeader, arrCountFields, pszCountSubtotal, arrCountOutputPaths),
+                ("重量", arrWeightHeader, arrWeightFields, pszWeightSubtotal, arrWeightOutputPaths),
+            ]:
+                pszOutputPath = create_step0005_discard_subtotal_output_path(
+                    dicPair[pszKind]
+                )
+                write_step0005_tsv(pszOutputPath, "\t".join(arrHeader + ["小計"]),
+                                   ["\t".join(arrFields + [pszSubtotal])])
+                arrCreatedPaths.append(pszOutputPath)
+                arrOutputPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCountOutputPaths, arrWeightOutputPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "DISCARD_SUBTOTAL_CLEANUP_FAILED",
+                "discard subtotal failed. Original error = " + str(objException)
+                + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0006_discard_summary_upper_output_path(
+    pszPlacementAveragePath: str,
+    pszSuffix: str,
+) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0004_総計_羽数データ別_入雛羽数・平均体重_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszPlacementAveragePath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0004_PLACEMENT_AVERAGE_FILE_NAME",
+            "invalid placement/average step0004 file name. Path = "
+            + pszPlacementAveragePath,
+        )
+    pszOutputStem = (
+        f"{objMatch.group(1)}_step0006_総計_廃棄データ一覧表_上段_"
+        + f"{objMatch.group(2)}_{objMatch.group(3)}"
+        + pszSuffix
+    )
+    pszDirectory = os.path.dirname(pszPlacementAveragePath)
+    pszOutputPath = os.path.join(pszDirectory, pszOutputStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszOutputStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0006_discard_summary_upper_input(
+    pszInputPath: str,
+    arrExpectedHeader: List[str],
+    iExpectedYear: int,
+    iExpectedMonth: int,
+) -> Tuple[List[str], List[str]]:
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0006_DISCARD_SUMMARY_UPPER_READ_FAILED",
+            "failed to read step0006 upper-section input. Path = " + pszInputPath
+            + "; Detail = " + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0006_DISCARD_SUMMARY_UPPER_ROW_COUNT",
+            "upper-section input must contain one header and one total row. Path = "
+            + pszInputPath,
+        )
+    arrHeader = arrLines[0].split("\t")
+    arrFields = arrLines[1].split("\t")
+    if arrHeader != arrExpectedHeader or len(arrFields) != len(arrExpectedHeader):
+        raise_conversion_error(
+            "INVALID_STEP0006_DISCARD_SUMMARY_UPPER_COLUMNS",
+            "unexpected upper-section input columns. Path = " + pszInputPath,
+        )
+    if parse_year_month(arrFields[0], arrFields[1], 2) != (
+        iExpectedYear, iExpectedMonth
+    ):
+        raise_conversion_error(
+            "STEP0006_DISCARD_SUMMARY_UPPER_YEAR_MONTH_MISMATCH",
+            "file name and row year/month do not match. Path = " + pszInputPath,
+        )
+    if arrFields[2:4] != ["", "総計"]:
+        raise_conversion_error(
+            "INVALID_STEP0006_DISCARD_SUMMARY_UPPER_GROUP",
+            "expected an empty group number and total group name. Path = "
+            + pszInputPath,
+        )
+    return arrHeader, arrFields
+
+
+def create_step0006_discard_summary_upper_files(
+    arrPlacementAveragePaths: List[str],
+    arrPreSlaughterCountPaths: List[str],
+    arrDiscardCountPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """入雛・平均体重、懸鳥前羽数、廃棄羽数の総計行を横結合します。"""
+    objPatterns = {
+        "placement": re.compile(
+            r"(.+)_step0004_総計_羽数データ別_入雛羽数・平均体重_"
+            r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv"
+        ),
+        "pre_slaughter": re.compile(
+            r"(.+)_step0005_総計_懸鳥前データ別_羽数_"
+            r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv"
+        ),
+        "discard": re.compile(
+            r"(.+)_step0005_総計_廃棄データ別_羽数_"
+            r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv"
+        ),
+    }
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszKind, arrPaths in [
+        ("placement", arrPlacementAveragePaths),
+        ("pre_slaughter", arrPreSlaughterCountPaths),
+        ("discard", arrDiscardCountPaths),
+    ]:
+        for pszPath in arrPaths:
+            objMatch = objPatterns[pszKind].fullmatch(os.path.basename(pszPath))
+            if objMatch is None:
+                raise_conversion_error(
+                    "INVALID_STEP0006_DISCARD_SUMMARY_UPPER_FILE_NAME",
+                    "invalid upper-section input file name. Path = " + pszPath,
+                )
+            iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
+            objKey = (
+                os.path.dirname(os.path.abspath(pszPath)), objMatch.group(1),
+                iYear, iMonth, objMatch.group(4),
+            )
+            dicPair = dicInputs.setdefault(objKey, {})
+            if pszKind in dicPair:
+                raise_conversion_error(
+                    "DUPLICATE_STEP0006_DISCARD_SUMMARY_UPPER_INPUT",
+                    "duplicate upper-section input. Path = " + pszPath,
+                )
+            dicPair[pszKind] = pszPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicPair = dicInputs[objKey]
+            if set(dicPair) != {"placement", "pre_slaughter", "discard"}:
+                raise_conversion_error(
+                    "MISSING_STEP0006_DISCARD_SUMMARY_UPPER_INPUT",
+                    "placement, pre-slaughter and discard count inputs must be paired for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}",
+                )
+            arrPlacementHeader, arrPlacementFields = (
+                read_step0006_discard_summary_upper_input(
+                    dicPair["placement"],
+                    ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"],
+                    objKey[2], objKey[3],
+                )
+            )
+            arrPreHeader, arrPreFields = read_step0006_discard_summary_upper_input(
+                dicPair["pre_slaughter"],
+                ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名"]
+                + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"],
+                objKey[2], objKey[3],
+            )
+            arrDiscardHeader, arrDiscardFields = read_step0006_discard_summary_upper_input(
+                dicPair["discard"],
+                ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名"]
+                + STEP0004_TOTAL_COUNT_ITEMS + ["小計"],
+                objKey[2], objKey[3],
+            )
+            if not (
+                arrPlacementFields[:4] == arrPreFields[:4]
+                == arrDiscardFields[:4]
+            ):
+                raise_conversion_error(
+                    "STEP0006_DISCARD_SUMMARY_UPPER_COMMON_COLUMNS_MISMATCH",
+                    "input common columns do not match. Key = " + str(objKey),
+                )
+            arrOutputHeader = (
+                arrPlacementHeader
+                + arrPreHeader[4:]
+                + arrDiscardHeader[4:]
+            )
+            arrOutputFields = (
+                arrPlacementFields
+                + arrPreFields[4:]
+                + arrDiscardFields[4:]
+            )
+            pszOutputPath = create_step0006_discard_summary_upper_output_path(
+                dicPair["placement"], objKey[4]
+            )
+            write_step0006_tsv(pszOutputPath, [arrOutputHeader, arrOutputFields])
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0006_DISCARD_SUMMARY_UPPER_CLEANUP_FAILED",
+                "upper-section combination failed. Original error = "
+                + str(objException) + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0006_discard_summary_lower_output_path(
+    pszShipmentCountWeightPath: str,
+    pszSuffix: str,
+) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0004_総計_羽数データ別_出荷羽数・出荷重量_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszShipmentCountWeightPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0004_SHIPMENT_COUNT_WEIGHT_FILE_NAME",
+            "invalid shipment count/weight step0004 file name. Path = "
+            + pszShipmentCountWeightPath,
+        )
+    pszOutputStem = (
+        f"{objMatch.group(1)}_step0006_総計_廃棄データ一覧表_下段_"
+        + f"{objMatch.group(2)}_{objMatch.group(3)}"
+        + pszSuffix
+    )
+    pszDirectory = os.path.dirname(pszShipmentCountWeightPath)
+    pszOutputPath = os.path.join(pszDirectory, pszOutputStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszOutputStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0006_discard_summary_lower_input(
+    pszInputPath: str,
+    arrExpectedHeader: List[str],
+    iExpectedYear: int,
+    iExpectedMonth: int,
+) -> Tuple[List[str], List[str]]:
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0006_DISCARD_SUMMARY_LOWER_READ_FAILED",
+            "failed to read step0006 lower-section input. Path = " + pszInputPath
+            + "; Detail = " + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0006_DISCARD_SUMMARY_LOWER_ROW_COUNT",
+            "lower-section input must contain one header and one total row. Path = "
+            + pszInputPath,
+        )
+    arrHeader = arrLines[0].split("\t")
+    arrFields = arrLines[1].split("\t")
+    if arrHeader != arrExpectedHeader or len(arrFields) != len(arrExpectedHeader):
+        raise_conversion_error(
+            "INVALID_STEP0006_DISCARD_SUMMARY_LOWER_COLUMNS",
+            "unexpected lower-section input columns. Path = " + pszInputPath,
+        )
+    if parse_year_month(arrFields[0], arrFields[1], 2) != (
+        iExpectedYear, iExpectedMonth
+    ):
+        raise_conversion_error(
+            "STEP0006_DISCARD_SUMMARY_LOWER_YEAR_MONTH_MISMATCH",
+            "file name and row year/month do not match. Path = " + pszInputPath,
+        )
+    if arrFields[2:4] != ["", "総計"]:
+        raise_conversion_error(
+            "INVALID_STEP0006_DISCARD_SUMMARY_LOWER_GROUP",
+            "expected an empty group number and total group name. Path = "
+            + pszInputPath,
+        )
+    return arrHeader, arrFields
+
+
+def create_step0006_discard_summary_lower_files(
+    arrShipmentCountWeightPaths: List[str],
+    arrPreSlaughterWeightPaths: List[str],
+    arrDiscardWeightPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """出荷羽数・重量、懸鳥前重量、廃棄重量の総計行を横結合します。"""
+    objPatterns = {
+        "shipment": re.compile(
+            r"(.+)_step0004_総計_羽数データ別_出荷羽数・出荷重量_"
+            r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv"
+        ),
+        "pre_slaughter_weight": re.compile(
+            r"(.+)_step0005_総計_懸鳥前データ別_重量_"
+            r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv"
+        ),
+        "discard_weight": re.compile(
+            r"(.+)_step0005_総計_廃棄データ別_重量_"
+            r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv"
+        ),
+    }
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszKind, arrPaths in [
+        ("shipment", arrShipmentCountWeightPaths),
+        ("pre_slaughter_weight", arrPreSlaughterWeightPaths),
+        ("discard_weight", arrDiscardWeightPaths),
+    ]:
+        for pszPath in arrPaths:
+            objMatch = objPatterns[pszKind].fullmatch(os.path.basename(pszPath))
+            if objMatch is None:
+                raise_conversion_error(
+                    "INVALID_STEP0006_DISCARD_SUMMARY_LOWER_FILE_NAME",
+                    "invalid lower-section input file name. Path = " + pszPath,
+                )
+            iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
+            objKey = (
+                os.path.dirname(os.path.abspath(pszPath)), objMatch.group(1),
+                iYear, iMonth, objMatch.group(4),
+            )
+            dicPair = dicInputs.setdefault(objKey, {})
+            if pszKind in dicPair:
+                raise_conversion_error(
+                    "DUPLICATE_STEP0006_DISCARD_SUMMARY_LOWER_INPUT",
+                    "duplicate lower-section input. Path = " + pszPath,
+                )
+            dicPair[pszKind] = pszPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicPair = dicInputs[objKey]
+            if set(dicPair) != {"shipment", "pre_slaughter_weight", "discard_weight"}:
+                raise_conversion_error(
+                    "MISSING_STEP0006_DISCARD_SUMMARY_LOWER_INPUT",
+                    "shipment, pre-slaughter and discard weight inputs must be paired for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}",
+                )
+            arrShipmentHeader, arrShipmentFields = (
+                read_step0006_discard_summary_lower_input(
+                    dicPair["shipment"],
+                    ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "出荷羽数", "出荷重量"],
+                    objKey[2], objKey[3],
+                )
+            )
+            arrPreHeader, arrPreFields = read_step0006_discard_summary_lower_input(
+                dicPair["pre_slaughter_weight"],
+                ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名"]
+                + STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS + ["小計"],
+                objKey[2], objKey[3],
+            )
+            arrDiscardHeader, arrDiscardFields = read_step0006_discard_summary_lower_input(
+                dicPair["discard_weight"],
+                ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名"]
+                + STEP0004_TOTAL_WEIGHT_ITEMS + ["小計"],
+                objKey[2], objKey[3],
+            )
+            if not (
+                arrShipmentFields[:4] == arrPreFields[:4]
+                == arrDiscardFields[:4]
+            ):
+                raise_conversion_error(
+                    "STEP0006_DISCARD_SUMMARY_LOWER_COMMON_COLUMNS_MISMATCH",
+                    "input common columns do not match. Key = " + str(objKey),
+                )
+            arrOutputHeader = (
+                arrShipmentHeader
+                + arrPreHeader[4:]
+                + arrDiscardHeader[4:]
+            )
+            arrOutputFields = (
+                arrShipmentFields
+                + arrPreFields[4:]
+                + arrDiscardFields[4:]
+            )
+            pszOutputPath = create_step0006_discard_summary_lower_output_path(
+                dicPair["shipment"], objKey[4]
+            )
+            write_step0006_tsv(pszOutputPath, [arrOutputHeader, arrOutputFields])
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0006_DISCARD_SUMMARY_LOWER_CLEANUP_FAILED",
+                "lower-section combination failed. Original error = "
+                + str(objException) + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def write_step0007_discard_summary_tsv(
+    pszOutputPath: str,
+    arrRows: List[List[str]],
+) -> None:
+    if not arrRows:
+        raise_conversion_error(
+            "INVALID_STEP0007_DISCARD_SUMMARY_ROW_COUNT",
+            "step0007 discard summary did not contain any rows.",
+        )
+    try:
+        write_monthly_tsv(
+            pszOutputPath,
+            "\t".join(arrRows[0]),
+            ["\t".join(arrRow) for arrRow in arrRows[1:]],
+        )
+    except ConversionError as objException:
+        dicErrorCodes = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0007_DISCARD_SUMMARY_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0007_DISCARD_SUMMARY_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0007_DISCARD_SUMMARY_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0007_DISCARD_SUMMARY_WRITE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(
+                objException.pszErrorCode, "STEP0007_DISCARD_SUMMARY_WRITE_FAILED"
+            ),
+            str(objException),
+        )
+
+
+def create_step0007_discard_summary_output_path(
+    pszInputPath: str,
+    pszSection: str,
+) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0006_総計_廃棄データ一覧表_(上段|下段)_"
+        r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszInputPath),
+    )
+    if objMatch is None or objMatch.group(2) != pszSection:
+        raise_conversion_error(
+            "INVALID_STEP0006_DISCARD_SUMMARY_FILE_NAME",
+            "invalid step0006 discard summary file name. Path = " + pszInputPath,
+        )
+    pszStem = (
+        f"{objMatch.group(1)}_step0007_総計_廃棄データ一覧表_{pszSection}_"
+        + f"{objMatch.group(3)}_{objMatch.group(4)}"
+        + objMatch.group(5)
+    )
+    pszDirectory = os.path.dirname(pszInputPath)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0007_discard_summary_files(
+    arrInputPaths: List[str],
+    pszSection: str,
+    arrExpectedHeader: List[str],
+    bWeight: bool,
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    if pszSection not in {"上段", "下段"}:
+        raise_conversion_error(
+            "INVALID_STEP0007_DISCARD_SUMMARY_SECTION",
+            "section must be 上段 or 下段.",
+        )
+    dicInputs: Dict[Tuple[str, str, int, int, str], str] = {}
+    for pszInputPath in arrInputPaths:
+        objMatch = re.fullmatch(
+            r"(.+)_step0006_総計_廃棄データ一覧表_(上段|下段)_"
+            r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+            os.path.basename(pszInputPath),
+        )
+        if objMatch is None or objMatch.group(2) != pszSection:
+            raise_conversion_error(
+                "INVALID_STEP0006_DISCARD_SUMMARY_FILE_NAME",
+                "invalid step0006 discard summary file name. Path = " + pszInputPath,
+            )
+        iYear, iMonth = parse_year_month(objMatch.group(3), objMatch.group(4), 1)
+        objKey = (
+            os.path.dirname(os.path.abspath(pszInputPath)), objMatch.group(1),
+            iYear, iMonth, objMatch.group(5),
+        )
+        if objKey in dicInputs:
+            raise_conversion_error(
+                "DUPLICATE_STEP0006_DISCARD_SUMMARY_FILE",
+                "duplicate step0006 discard summary file. Path = " + pszInputPath,
+            )
+        dicInputs[objKey] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            pszInputPath = dicInputs[objKey]
+            try:
+                with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+                    arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+            except Exception as objException:
+                raise_conversion_error(
+                    "STEP0006_DISCARD_SUMMARY_READ_FAILED",
+                    "failed to read step0006 discard summary. Path = " + pszInputPath
+                    + "; Detail = " + str(objException),
+                )
+            if len(arrLines) != 2:
+                raise_conversion_error(
+                    "INVALID_STEP0006_DISCARD_SUMMARY_ROW_COUNT",
+                    "step0006 discard summary must contain one header and one data row. "
+                    + "Path = " + pszInputPath,
+                )
+            arrHeader = arrLines[0].split("\t")
+            arrFields = arrLines[1].split("\t")
+            if arrHeader != arrExpectedHeader or len(arrFields) != len(arrExpectedHeader):
+                raise_conversion_error(
+                    "INVALID_STEP0006_DISCARD_SUMMARY_COLUMNS",
+                    "unexpected step0006 discard summary columns. Path = " + pszInputPath,
+                )
+            if parse_year_month(arrFields[0], arrFields[1], 2) != (
+                objKey[2], objKey[3]
+            ):
+                raise_conversion_error(
+                    "STEP0006_DISCARD_SUMMARY_YEAR_MONTH_MISMATCH",
+                    "file name and row year/month do not match. Path = " + pszInputPath,
+                )
+            if arrFields[2:4] != ["", "総計"]:
+                raise_conversion_error(
+                    "INVALID_STEP0006_DISCARD_SUMMARY_GROUP",
+                    "expected an empty group number and total group name. Path = "
+                    + pszInputPath,
+                )
+            iFirstSubtotal = arrHeader.index("小計")
+            iLastSubtotal = len(arrHeader) - 1 - arrHeader[::-1].index("小計")
+            objSubtotalValues: List[Decimal] = []
+            for iColumnIndex in (iFirstSubtotal, iLastSubtotal):
+                objValue = parse_decimal_value(
+                    arrFields[iColumnIndex].replace(",", ""),
+                    2,
+                    iColumnIndex,
+                    "小計",
+                )
+                if objValue is None:
+                    raise_conversion_error(
+                        "INVALID_STEP0006_DISCARD_SUMMARY_SUBTOTAL",
+                        "subtotal value was blank. Path = " + pszInputPath,
+                    )
+                objSubtotalValues.append(objValue)
+            objTotal = sum(objSubtotalValues, Decimal("0"))
+            pszTotal = (
+                format(objTotal.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP), ",.1f")
+                if bWeight
+                else format(Decimal(format_sum_value(objTotal)), ",f")
+            )
+            pszOutputPath = create_step0007_discard_summary_output_path(
+                pszInputPath, pszSection
+            )
+            write_step0007_discard_summary_tsv(
+                pszOutputPath, [arrHeader + ["合計"], arrFields + [pszTotal]]
+            )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0007_DISCARD_SUMMARY_CLEANUP_FAILED",
+                "step0007 discard summary creation failed. Original error = "
+                + str(objException) + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0007_discard_summary_upper_files(
+    arrStep0006UpperPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    arrExpectedHeader = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"]
+        + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"]
+        + STEP0004_TOTAL_COUNT_ITEMS + ["小計"]
+    )
+    return create_step0007_discard_summary_files(
+        arrStep0006UpperPaths, "上段", arrExpectedHeader, False
+    )
+
+
+def create_step0007_discard_summary_lower_files(
+    arrStep0006LowerPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    arrExpectedHeader = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "出荷羽数", "出荷重量"]
+        + STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS + ["小計"]
+        + STEP0004_TOTAL_WEIGHT_ITEMS + ["小計"]
+    )
+    return create_step0007_discard_summary_files(
+        arrStep0006LowerPaths, "下段", arrExpectedHeader, True
+    )
+
+
+def create_step0008_discard_summary_output_path(pszUpperInputPath: str) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0007_総計_廃棄データ一覧表_上段_"
+        r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszUpperInputPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0007_DISCARD_SUMMARY_UPPER_FILE_NAME",
+            "invalid step0007 upper-section file name. Path = " + pszUpperInputPath,
+        )
+    pszStem = (
+        f"{objMatch.group(1)}_step0008_総計_廃棄データ一覧表_"
+        f"{objMatch.group(2)}_{objMatch.group(3)}{objMatch.group(4)}"
+    )
+    pszDirectory = os.path.dirname(pszUpperInputPath)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def normalize_step0008_discard_summary_headers(
+    arrUpperHeader: List[str], arrLowerHeader: List[str]
+) -> Tuple[List[str], List[str]]:
+    arrUpperExpected = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"]
+        + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"]
+        + STEP0004_TOTAL_COUNT_ITEMS + ["小計", "合計"]
+    )
+    arrLowerExpected = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "出荷羽数", "出荷重量"]
+        + STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS + ["小計"]
+        + STEP0004_TOTAL_WEIGHT_ITEMS + ["小計", "合計"]
+    )
+    if arrUpperHeader != arrUpperExpected or arrLowerHeader != arrLowerExpected:
+        raise_conversion_error(
+            "INVALID_STEP0007_DISCARD_SUMMARY_COLUMNS",
+            "step0007 upper or lower summary has unexpected columns.",
+        )
+
+    arrUpperOutput = list(arrUpperHeader)
+    arrUpperOutput[:4] = ["", "", "", ""]
+    arrUpperOutput[6] = "懸鳥前"
+    arrUpperOutput[7] = "懸鳥前"
+    iUpperDiscardStart = (
+        4 + 2 + len(STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS) + 1
+    )
+    for iColumn in range(
+        iUpperDiscardStart,
+        iUpperDiscardStart + len(STEP0004_TOTAL_COUNT_ITEMS),
+    ):
+        arrUpperOutput[iColumn] = ""
+    arrUpperOutput[iUpperDiscardStart] = "自主廃棄＋検査廃棄"
+
+    arrLowerOutput = list(arrLowerHeader)
+    arrLowerOutput[6] = "死鶏"
+    iLowerDiscardStart = (
+        4 + 2 + len(STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS) + 1
+    )
+    for iColumn in range(
+        iLowerDiscardStart,
+        iLowerDiscardStart + len(STEP0004_TOTAL_WEIGHT_ITEMS),
+    ):
+        pszHeader = arrLowerOutput[iColumn]
+        if pszHeader.endswith("羽数"):
+            arrLowerOutput[iColumn] = pszHeader[:-2]
+        elif pszHeader.endswith("重量"):
+            arrLowerOutput[iColumn] = pszHeader[:-2]
+    return arrUpperOutput, arrLowerOutput
+
+
+def create_step0008_discard_summary_files(
+    arrStep0007UpperPaths: List[str], arrStep0007LowerPaths: List[str]
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """step0007の上段・下段を結合し、step0008廃棄一覧表を作成します。"""
+    objPattern = re.compile(
+        r"(.+)_step0007_総計_廃棄データ一覧表_(上段|下段)_"
+        r"(\d{4})_(\d{2})((?:_\d+)*)\.tsv"
+    )
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszSection, arrPaths in (
+        ("上段", arrStep0007UpperPaths), ("下段", arrStep0007LowerPaths)
+    ):
+        for pszInputPath in arrPaths:
+            objMatch = objPattern.fullmatch(os.path.basename(pszInputPath))
+            if objMatch is None or objMatch.group(2) != pszSection:
+                raise_conversion_error(
+                    "INVALID_STEP0007_DISCARD_SUMMARY_FILE_NAME",
+                    "invalid step0007 summary file name. Path = " + pszInputPath,
+                )
+            iYear, iMonth = parse_year_month(objMatch.group(3), objMatch.group(4), 1)
+            objKey = (
+                os.path.dirname(os.path.abspath(pszInputPath)), objMatch.group(1),
+                iYear, iMonth, objMatch.group(5),
+            )
+            dicPair = dicInputs.setdefault(objKey, {})
+            if pszSection in dicPair:
+                raise_conversion_error(
+                    "DUPLICATE_STEP0007_DISCARD_SUMMARY_FILE",
+                    "duplicate step0007 summary file. Path = " + pszInputPath,
+                )
+            dicPair[pszSection] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda key: (key[2], key[3], key[0], key[1], key[4])):
+            dicPair = dicInputs[objKey]
+            if set(dicPair) != {"上段", "下段"}:
+                raise_conversion_error(
+                    "MISSING_STEP0007_DISCARD_SUMMARY_PAIR",
+                    "matching upper and lower step0007 files are required. Key = "
+                    + str(objKey),
+                )
+
+            arrLoaded: Dict[str, List[List[str]]] = {}
+            for pszSection in ("上段", "下段"):
+                pszInputPath = dicPair[pszSection]
+                try:
+                    with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+                        arrLines = [strip_line_ending(line) for line in objFile]
+                except Exception as objException:
+                    raise_conversion_error(
+                        "STEP0007_DISCARD_SUMMARY_READ_FAILED",
+                        "failed to read step0007 summary. Path = "
+                        + pszInputPath + "; Detail = " + str(objException),
+                    )
+                if len(arrLines) != 2:
+                    raise_conversion_error(
+                        "INVALID_STEP0007_DISCARD_SUMMARY_ROW_COUNT",
+                        "step0007 summary must contain a header and one data row. Path = "
+                        + pszInputPath,
+                    )
+                arrLoaded[pszSection] = [line.split("\t") for line in arrLines]
+
+            arrUpperHeader, arrUpperValues = arrLoaded["上段"]
+            arrLowerHeader, arrLowerValues = arrLoaded["下段"]
+            arrUpperHeader, arrLowerHeader = normalize_step0008_discard_summary_headers(
+                arrUpperHeader, arrLowerHeader
+            )
+            if (
+                len(arrUpperValues) != len(arrUpperHeader)
+                or len(arrLowerValues) != len(arrLowerHeader)
+            ):
+                raise_conversion_error(
+                    "INVALID_STEP0007_DISCARD_SUMMARY_COLUMNS",
+                    "step0007 data row column count does not match its header. Key = "
+                    + str(objKey),
+                )
+            for arrValues in (arrUpperValues, arrLowerValues):
+                if parse_year_month(
+                    arrValues[0], arrValues[1], 2
+                ) != (objKey[2], objKey[3]):
+                    raise_conversion_error(
+                        "STEP0007_DISCARD_SUMMARY_YEAR_MONTH_MISMATCH",
+                        "file name and row year/month do not match. Key = " + str(objKey),
+                    )
+                if arrValues[2:4] != ["", "総計"]:
+                    raise_conversion_error(
+                        "INVALID_STEP0007_DISCARD_SUMMARY_GROUP",
+                        "expected an empty group number and total group name. Key = "
+                        + str(objKey),
+                    )
+            if arrUpperValues[:4] != arrLowerValues[:4]:
+                raise_conversion_error(
+                    "STEP0007_DISCARD_SUMMARY_COMMON_COLUMNS_MISMATCH",
+                    "upper and lower year/month/group values do not match. Key = "
+                    + str(objKey),
+                )
+
+            arrOutputRows = [
+                arrUpperHeader, arrLowerHeader, arrUpperValues, arrLowerValues
+            ]
+            pszOutputPath = create_step0008_discard_summary_output_path(dicPair["上段"])
+            try:
+                write_monthly_tsv(
+                    pszOutputPath,
+                    "\t".join(arrOutputRows[0]),
+                    ["\t".join(row) for row in arrOutputRows[1:]],
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "STEP0008_DISCARD_SUMMARY_WRITE_FAILED", str(objException)
+                )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0008_DISCARD_SUMMARY_CLEANUP_FAILED",
+                "step0008 discard summary creation failed. Original error = "
+                + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0009_discard_summary_output_path(pszInputPath: str) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0008_総計_廃棄データ一覧表_(\d{4})_(\d{2})"
+        r"((?:_\d+)*)\.tsv",
+        os.path.basename(pszInputPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0008_DISCARD_SUMMARY_FILE_NAME",
+            "invalid step0008 discard summary file name. Path = " + pszInputPath,
+        )
+    pszStem = (
+        f"{objMatch.group(1)}_step0009_総計_廃棄データ一覧表_"
+        f"{objMatch.group(2)}_{objMatch.group(3)}{objMatch.group(4)}"
+    )
+    pszDirectory = os.path.dirname(pszInputPath)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def format_step0009_discard_weight_subtotal(pszValue: str, iColumn: int) -> str:
+    objValue = parse_decimal_value(
+        pszValue.replace(",", ""), 4, iColumn, "小計・合計"
+    )
+    if objValue is None:
+        raise_conversion_error(
+            "INVALID_STEP0008_DISCARD_SUMMARY_TOTAL",
+            "weight subtotal or total was blank. Column = " + str(iColumn + 1),
+        )
+    return format(
+        objValue.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), ",.2f"
+    )
+
+
+def create_step0009_discard_summary_files(
+    arrStep0008DiscardSummaryPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """step0008の総計一覧表からグループ列を除き、羽数・重量区分列を加えます。"""
+    objPattern = re.compile(
+        r"(.+)_step0008_総計_廃棄データ一覧表_(\d{4})_(\d{2})"
+        r"((?:_\d+)*)\.tsv"
+    )
+    arrUpperSourceHeader = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"]
+        + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"]
+        + STEP0004_TOTAL_COUNT_ITEMS + ["小計", "合計"]
+    )
+    arrLowerSourceHeader = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "出荷羽数", "出荷重量"]
+        + STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS + ["小計"]
+        + STEP0004_TOTAL_WEIGHT_ITEMS + ["小計", "合計"]
+    )
+    arrUpperHeader, arrLowerHeader = normalize_step0008_discard_summary_headers(
+        arrUpperSourceHeader, arrLowerSourceHeader
+    )
+    arrExpectedRows = [arrUpperHeader, arrLowerHeader]
+    dicInputs: Dict[Tuple[str, str, int, int, str], str] = {}
+    for pszInputPath in arrStep0008DiscardSummaryPaths:
+        objMatch = objPattern.fullmatch(os.path.basename(pszInputPath))
+        if objMatch is None:
+            raise_conversion_error(
+                "INVALID_STEP0008_DISCARD_SUMMARY_FILE_NAME",
+                "invalid step0008 discard summary file name. Path = " + pszInputPath,
+            )
+        iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
+        objKey = (
+            os.path.dirname(os.path.abspath(pszInputPath)), objMatch.group(1),
+            iYear, iMonth, objMatch.group(4),
+        )
+        if objKey in dicInputs:
+            raise_conversion_error(
+                "DUPLICATE_STEP0008_DISCARD_SUMMARY_FILE",
+                "duplicate step0008 discard summary file. Path = " + pszInputPath,
+            )
+        dicInputs[objKey] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(
+            dicInputs, key=lambda key: (key[2], key[3], key[0], key[1], key[4])
+        ):
+            pszInputPath = dicInputs[objKey]
+            try:
+                with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+                    arrLines = [strip_line_ending(line) for line in objFile]
+            except Exception as objException:
+                raise_conversion_error(
+                    "STEP0008_DISCARD_SUMMARY_READ_FAILED",
+                    "failed to read step0008 discard summary. Path = "
+                    + pszInputPath + "; Detail = " + str(objException),
+                )
+            if len(arrLines) != 4:
+                raise_conversion_error(
+                    "INVALID_STEP0008_DISCARD_SUMMARY_ROW_COUNT",
+                    "step0008 discard summary must contain four rows. Path = "
+                    + pszInputPath,
+                )
+            arrRows = [line.split("\t") for line in arrLines]
+            if arrRows[:2] != arrExpectedRows:
+                raise_conversion_error(
+                    "INVALID_STEP0008_DISCARD_SUMMARY_COLUMNS",
+                    "unexpected step0008 discard summary title rows. Path = "
+                    + pszInputPath,
+                )
+            if (
+                len(arrRows[0]) != len(arrUpperHeader)
+                or len(arrRows[1]) != len(arrLowerHeader)
+                or len(arrRows[2]) != len(arrUpperHeader)
+                or len(arrRows[3]) != len(arrLowerHeader)
+            ):
+                raise_conversion_error(
+                    "INVALID_STEP0008_DISCARD_SUMMARY_COLUMNS",
+                    "step0008 rows must match upper/lower header widths. Path = "
+                    + pszInputPath,
+                )
+
+            for iRow in (2, 3):
+                arrValues = arrRows[iRow]
+                if parse_year_month(arrValues[0], arrValues[1], iRow + 1) != (
+                    objKey[2], objKey[3]
+                ):
+                    raise_conversion_error(
+                        "STEP0008_DISCARD_SUMMARY_YEAR_MONTH_MISMATCH",
+                        "file name and row year/month do not match. Path = "
+                        + pszInputPath,
+                    )
+                if arrValues[2:4] != ["", "総計"]:
+                    raise_conversion_error(
+                        "INVALID_STEP0008_DISCARD_SUMMARY_GROUP",
+                        "expected an empty group number and total group name. Path = "
+                        + pszInputPath,
+                    )
+            if arrRows[2][:4] != arrRows[3][:4]:
+                raise_conversion_error(
+                    "STEP0008_DISCARD_SUMMARY_COMMON_COLUMNS_MISMATCH",
+                    "upper and lower year/month/group values do not match. Path = "
+                    + pszInputPath,
+                )
+
+            arrOutputRows: List[List[str]] = []
+            for iRow, arrSourceRow in enumerate(arrRows):
+                arrOutputRow = arrSourceRow[:2] + arrSourceRow[4:]
+                arrOutputRow.insert(4, "")
+                if iRow == 2:
+                    arrOutputRow[4] = "羽数"
+                elif iRow == 3:
+                    arrOutputRow[4] = "重量"
+                    for iColumn, pszHeader in enumerate(arrOutputRows[1]):
+                        if pszHeader in {"小計", "合計"}:
+                            arrOutputRow[iColumn] = format_step0009_discard_weight_subtotal(
+                                arrOutputRow[iColumn], iColumn
+                            )
+                arrOutputRows.append(arrOutputRow)
+
+            for iRow in (2, 3):
+                objYearMonth = parse_year_month(
+                    arrOutputRows[iRow][0], arrOutputRows[iRow][1], iRow + 1
+                )
+                arrOutputRows[iRow][0] = str(objYearMonth[0])
+                arrOutputRows[iRow][1] = str(objYearMonth[1])
+
+            pszOutputPath = create_step0009_discard_summary_output_path(pszInputPath)
+            try:
+                write_monthly_tsv(
+                    pszOutputPath,
+                    "\t".join(arrOutputRows[0]),
+                    ["\t".join(row) for row in arrOutputRows[1:]],
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "STEP0009_DISCARD_SUMMARY_WRITE_FAILED", str(objException)
+                )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0009_DISCARD_SUMMARY_CLEANUP_FAILED",
+                "step0009 discard summary creation failed. Original error = "
+                + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0010_discard_summary_output_path(
+    pszDirectory: str, pszBaseName: str
+) -> str:
+    pszStem = f"{pszBaseName}_step0010_総計_廃棄データ一覧表"
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0010_discard_summary_files(
+    arrStep0009DiscardSummaryPaths: List[str],
+) -> List[str]:
+    """step0009月別総計一覧表を新しい順に1つのstep0010 TSVへ連結します。"""
+    objPattern = re.compile(
+        r"(.+)_step0009_総計_廃棄データ一覧表_(\d{4})_(\d{2})"
+        r"((?:_\d+)*)\.tsv"
+    )
+    arrUpperSourceHeader = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "入雛羽数", "平均体重"]
+        + STEP0004_TOTAL_PRE_SLAUGHTER_COUNT_ITEMS + ["小計"]
+        + STEP0004_TOTAL_COUNT_ITEMS + ["小計", "合計"]
+    )
+    arrLowerSourceHeader = (
+        ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", "出荷羽数", "出荷重量"]
+        + STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS + ["小計"]
+        + STEP0004_TOTAL_WEIGHT_ITEMS + ["小計", "合計"]
+    )
+    arrUpperStep8Header, arrLowerStep8Header = (
+        normalize_step0008_discard_summary_headers(
+            arrUpperSourceHeader, arrLowerSourceHeader
+        )
+    )
+    arrExpectedHeaders: List[List[str]] = []
+    for arrHeader in (arrUpperStep8Header, arrLowerStep8Header):
+        arrExpectedHeader = arrHeader[:2] + arrHeader[4:]
+        arrExpectedHeader.insert(4, "")
+        arrExpectedHeaders.append(arrExpectedHeader)
+
+    dicInputs: Dict[Tuple[str, str], Dict[Tuple[int, int], str]] = {}
+    for pszInputPath in arrStep0009DiscardSummaryPaths:
+        objMatch = objPattern.fullmatch(os.path.basename(pszInputPath))
+        if objMatch is None:
+            raise_conversion_error(
+                "INVALID_STEP0009_DISCARD_SUMMARY_FILE_NAME",
+                "invalid step0009 discard summary file name. Path = " + pszInputPath,
+            )
+        iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
+        objKey = (os.path.dirname(os.path.abspath(pszInputPath)), objMatch.group(1))
+        objYearMonth = (iYear, iMonth)
+        dicByMonth = dicInputs.setdefault(objKey, {})
+        if objYearMonth in dicByMonth:
+            raise_conversion_error(
+                "DUPLICATE_STEP0009_DISCARD_SUMMARY_MONTH",
+                "multiple step0009 discard summaries have the same year/month. Key = "
+                + str(objKey) + ", YearMonth = " + str(objYearMonth),
+            )
+        dicByMonth[objYearMonth] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    try:
+        for objKey in sorted(dicInputs):
+            dicByMonth = dicInputs[objKey]
+            arrRowsByMonth: Dict[Tuple[int, int], List[List[str]]] = {}
+            arrTitleRows: Optional[List[List[str]]] = None
+            for objYearMonth in sorted(dicByMonth, reverse=True):
+                pszInputPath = dicByMonth[objYearMonth]
+                try:
+                    with open(
+                        pszInputPath, "r", encoding="utf-8", newline=""
+                    ) as objFile:
+                        arrLines = [strip_line_ending(line) for line in objFile]
+                except Exception as objException:
+                    raise_conversion_error(
+                        "STEP0009_DISCARD_SUMMARY_READ_FAILED",
+                        "failed to read step0009 discard summary. Path = "
+                        + pszInputPath + "; Detail = " + str(objException),
+                    )
+                if len(arrLines) != 4:
+                    raise_conversion_error(
+                        "INVALID_STEP0009_DISCARD_SUMMARY_ROW_COUNT",
+                        "step0009 discard summary must contain four rows. Path = "
+                        + pszInputPath,
+                    )
+                arrRows = [line.split("\t") for line in arrLines]
+                if arrRows[:2] != arrExpectedHeaders:
+                    raise_conversion_error(
+                        "INVALID_STEP0009_DISCARD_SUMMARY_COLUMNS",
+                        "unexpected step0009 discard summary title rows. Path = "
+                        + pszInputPath,
+                    )
+                if (
+                    len(arrRows[0]) != len(arrExpectedHeaders[0])
+                    or len(arrRows[1]) != len(arrExpectedHeaders[1])
+                    or len(arrRows[2]) != len(arrExpectedHeaders[0])
+                    or len(arrRows[3]) != len(arrExpectedHeaders[1])
+                ):
+                    raise_conversion_error(
+                        "INVALID_STEP0009_DISCARD_SUMMARY_COLUMNS",
+                        "step0009 rows must match their upper/lower header widths. Path = "
+                        + pszInputPath,
+                    )
+                for iRow in (2, 3):
+                    if parse_year_month(
+                        arrRows[iRow][0], arrRows[iRow][1], iRow + 1
+                    ) != objYearMonth:
+                        raise_conversion_error(
+                            "STEP0009_DISCARD_SUMMARY_YEAR_MONTH_MISMATCH",
+                            "file name and row year/month do not match. Path = "
+                            + pszInputPath,
+                        )
+                if arrRows[2][4] != "羽数" or arrRows[3][4] != "重量":
+                    raise_conversion_error(
+                        "INVALID_STEP0009_DISCARD_SUMMARY_KIND",
+                        "expected 羽数 and 重量 data rows. Path = " + pszInputPath,
+                    )
+                if arrRows[2][:2] != arrRows[3][:2]:
+                    raise_conversion_error(
+                        "STEP0009_DISCARD_SUMMARY_COMMON_COLUMNS_MISMATCH",
+                        "the two data rows must have matching year/month. Path = "
+                        + pszInputPath,
+                    )
+                if arrTitleRows is None:
+                    arrTitleRows = arrRows[:2]
+                elif arrTitleRows != arrRows[:2]:
+                    raise_conversion_error(
+                        "STEP0009_DISCARD_SUMMARY_TITLE_MISMATCH",
+                        "title rows differ between monthly files. Path = "
+                        + pszInputPath,
+                    )
+
+                arrLowerValues = list(arrRows[3])
+                arrLowerValues[0] = ""
+                arrLowerValues[1] = ""
+                arrRowsByMonth[objYearMonth] = [arrRows[2], arrLowerValues]
+
+            if arrTitleRows is None:
+                continue
+            arrOutputRows = arrTitleRows[:]
+            for objYearMonth in sorted(arrRowsByMonth, reverse=True):
+                arrOutputRows.extend(arrRowsByMonth[objYearMonth])
+
+            pszOutputPath = create_step0010_discard_summary_output_path(
+                objKey[0], objKey[1]
+            )
+            try:
+                write_monthly_tsv(
+                    pszOutputPath,
+                    "\t".join(arrOutputRows[0]),
+                    ["\t".join(row) for row in arrOutputRows[1:]],
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "STEP0010_DISCARD_SUMMARY_WRITE_FAILED", str(objException)
+                )
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0010_DISCARD_SUMMARY_CLEANUP_FAILED",
+                "step0010 discard summary creation failed. Original error = "
+                + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+STEP0004_TOTAL_PLACEMENT_AVERAGE_ITEMS: List[str] = [
+    "入雛羽数", "平均体重",
+]
+
+
+def create_step0004_total_placement_average_output_path(
+    pszFirstInputPath: str,
+) -> str:
+    pszBaseName, _, iYear, iMonth, pszSuffix = parse_step0003_total_file_name(
+        pszFirstInputPath
+    )
+    pszDirectory: str = os.path.dirname(pszFirstInputPath)
+    pszStem: str = (
+        f"{pszBaseName}_step0004_総計_羽数データ別_入雛羽数・平均体重_{iYear:04d}_{iMonth:02d}"
+        + pszSuffix
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0003_total_placement_average_item(
+    pszInputPath: str, pszExpectedItem: str,
+) -> Tuple[List[str], List[str]]:
+    _, pszItemName, iFileYear, iFileMonth, _ = parse_step0003_total_file_name(
+        pszInputPath
+    )
+    if pszItemName != pszExpectedItem:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ITEM", "unexpected item. Path = " + pszInputPath,
+        )
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0003_TOTAL_READ_FAILED",
+            "failed to read step0003 total TSV. Path = " + pszInputPath
+            + "; Detail = " + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ROW_COUNT",
+            "step0003 total TSV must contain one header and one data row. Path = "
+            + pszInputPath,
+        )
+    arrHeader = arrLines[0].split("\t")
+    arrFields = arrLines[1].split("\t")
+    if len(arrHeader) != 5 or len(arrFields) != 5:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_COLUMN_COUNT",
+            "step0003 total TSV must contain five columns. Path = " + pszInputPath,
+        )
+    if arrHeader != ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", pszExpectedItem]:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_HEADER",
+            "unexpected step0003 total header. Path = " + pszInputPath,
+        )
+    if parse_year_month(arrFields[0], arrFields[1], 2) != (iFileYear, iFileMonth):
+        raise_conversion_error(
+            "STEP0003_TOTAL_YEAR_MONTH_MISMATCH",
+            "file name and data year/month do not match. Path = " + pszInputPath,
+        )
+    if arrFields[2:4] != ["", "総計"]:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_GROUP",
+            "expected an empty group number and total group name. Path = " + pszInputPath,
+        )
+    if (parse_decimal_value(arrFields[4], 2, 4, pszExpectedItem) is None
+            and pszExpectedItem != "平均体重"):
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ITEM_VALUE",
+            "placement count was blank. Path = " + pszInputPath,
+        )
+    return arrHeader, arrFields
+
+
+def create_step0004_total_placement_average_files(
+    arrStep0003TotalPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """同じ年月の入雛羽数と平均体重を横結合し、値と平均体重の空欄を保持します。"""
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszInputPath in arrStep0003TotalPaths:
+        pszBaseName, pszItemName, iYear, iMonth, pszSuffix = (
+            parse_step0003_total_file_name(pszInputPath)
+        )
+        objKey = (os.path.dirname(os.path.abspath(pszInputPath)),
+                  pszBaseName, iYear, iMonth, pszSuffix)
+        dicItems = dicInputs.setdefault(objKey, {})
+        if pszItemName not in STEP0004_TOTAL_PLACEMENT_AVERAGE_ITEMS:
+            continue
+        if pszItemName in dicItems:
+            raise_conversion_error(
+                "DUPLICATE_STEP0003_TOTAL_PLACEMENT_AVERAGE_ITEM",
+                "duplicate placement/average weight item. Path = " + pszInputPath,
+            )
+        dicItems[pszItemName] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicItems = dicInputs[objKey]
+            arrMissing = [pszItem for pszItem in STEP0004_TOTAL_PLACEMENT_AVERAGE_ITEMS
+                          if pszItem not in dicItems]
+            if arrMissing:
+                raise_conversion_error(
+                    "MISSING_STEP0003_TOTAL_PLACEMENT_AVERAGE_ITEMS",
+                    "missing placement/average weight items for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}: "
+                    + ", ".join(arrMissing),
+                )
+            arrOutputHeader: List[str] = []
+            arrOutputFields: List[str] = []
+            for pszItem in STEP0004_TOTAL_PLACEMENT_AVERAGE_ITEMS:
+                arrHeader, arrFields = read_step0003_total_placement_average_item(
+                    dicItems[pszItem], pszItem
+                )
+                if not arrOutputFields:
+                    arrOutputHeader = arrHeader[:4]
+                    arrOutputFields = arrFields[:4]
+                elif arrFields[:4] != arrOutputFields[:4]:
+                    raise_conversion_error(
+                        "STEP0003_TOTAL_COMMON_COLUMNS_MISMATCH",
+                        "common columns do not match. Path = " + dicItems[pszItem],
+                    )
+                arrOutputHeader.append(arrHeader[4])
+                arrOutputFields.append(arrFields[4])
+            pszOutputPath = create_step0004_total_placement_average_output_path(
+                dicItems[STEP0004_TOTAL_PLACEMENT_AVERAGE_ITEMS[0]]
+            )
+            write_step0004_tsv(
+                pszOutputPath, "\t".join(arrOutputHeader), "\t".join(arrOutputFields)
+            )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0004_TOTAL_PLACEMENT_AVERAGE_CLEANUP_FAILED",
+                "placement/average weight combination failed. Original error = " + str(objException)
+                + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+STEP0004_TOTAL_SHIPMENT_COUNT_WEIGHT_ITEMS: List[str] = [
+    "出荷羽数", "出荷重量",
+]
+
+
+def create_step0004_total_shipment_count_weight_output_path(
+    pszFirstInputPath: str,
+) -> str:
+    pszBaseName, _, iYear, iMonth, pszSuffix = parse_step0003_total_file_name(
+        pszFirstInputPath
+    )
+    pszDirectory: str = os.path.dirname(pszFirstInputPath)
+    pszStem: str = (
+        f"{pszBaseName}_step0004_総計_羽数データ別_出荷羽数・出荷重量_{iYear:04d}_{iMonth:02d}"
+        + pszSuffix
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0003_total_shipment_count_weight_item(
+    pszInputPath: str, pszExpectedItem: str,
+) -> Tuple[List[str], List[str]]:
+    _, pszItemName, iFileYear, iFileMonth, _ = parse_step0003_total_file_name(
+        pszInputPath
+    )
+    if pszItemName != pszExpectedItem:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ITEM", "unexpected item. Path = " + pszInputPath,
+        )
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0003_TOTAL_READ_FAILED",
+            "failed to read step0003 total TSV. Path = " + pszInputPath
+            + "; Detail = " + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ROW_COUNT",
+            "step0003 total TSV must contain one header and one data row. Path = "
+            + pszInputPath,
+        )
+    arrHeader = arrLines[0].split("\t")
+    arrFields = arrLines[1].split("\t")
+    if len(arrHeader) != 5 or len(arrFields) != 5:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_COLUMN_COUNT",
+            "step0003 total TSV must contain five columns. Path = " + pszInputPath,
+        )
+    if arrHeader != ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名", pszExpectedItem]:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_HEADER",
+            "unexpected step0003 total header. Path = " + pszInputPath,
+        )
+    if parse_year_month(arrFields[0], arrFields[1], 2) != (iFileYear, iFileMonth):
+        raise_conversion_error(
+            "STEP0003_TOTAL_YEAR_MONTH_MISMATCH",
+            "file name and data year/month do not match. Path = " + pszInputPath,
+        )
+    if arrFields[2:4] != ["", "総計"]:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_GROUP",
+            "expected an empty group number and total group name. Path = " + pszInputPath,
+        )
+    if parse_decimal_value(arrFields[4], 2, 4, pszExpectedItem) is None:
+        raise_conversion_error(
+            "INVALID_STEP0003_TOTAL_ITEM_VALUE",
+            "shipment count/weight was blank. Path = " + pszInputPath,
+        )
+    return arrHeader, arrFields
+
+
+def create_step0004_total_shipment_count_weight_files(
+    arrStep0003TotalPaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """同じ年月の出荷羽数と出荷重量を横結合し、入力値の表記を保持します。"""
+    dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
+    for pszInputPath in arrStep0003TotalPaths:
+        pszBaseName, pszItemName, iYear, iMonth, pszSuffix = (
+            parse_step0003_total_file_name(pszInputPath)
+        )
+        objKey = (os.path.dirname(os.path.abspath(pszInputPath)),
+                  pszBaseName, iYear, iMonth, pszSuffix)
+        dicItems = dicInputs.setdefault(objKey, {})
+        if pszItemName not in STEP0004_TOTAL_SHIPMENT_COUNT_WEIGHT_ITEMS:
+            continue
+        if pszItemName in dicItems:
+            raise_conversion_error(
+                "DUPLICATE_STEP0003_TOTAL_SHIPMENT_COUNT_WEIGHT_ITEM",
+                "duplicate shipment count/weight item. Path = " + pszInputPath,
+            )
+        dicItems[pszItemName] = pszInputPath
+
+    arrCreatedPaths: List[str] = []
+    arrYearMonths: List[Tuple[int, int]] = []
+    try:
+        for objKey in sorted(dicInputs, key=lambda objKey: (
+            objKey[2], objKey[3], objKey[0], objKey[1], objKey[4]
+        )):
+            dicItems = dicInputs[objKey]
+            arrMissing = [pszItem for pszItem in STEP0004_TOTAL_SHIPMENT_COUNT_WEIGHT_ITEMS
+                          if pszItem not in dicItems]
+            if arrMissing:
+                raise_conversion_error(
+                    "MISSING_STEP0003_TOTAL_SHIPMENT_COUNT_WEIGHT_ITEMS",
+                    "missing shipment count/weight items for "
+                    + f"{objKey[1]} {objKey[2]:04d}_{objKey[3]:02d}{objKey[4]}: "
+                    + ", ".join(arrMissing),
+                )
+            arrOutputHeader: List[str] = []
+            arrOutputFields: List[str] = []
+            for pszItem in STEP0004_TOTAL_SHIPMENT_COUNT_WEIGHT_ITEMS:
+                arrHeader, arrFields = read_step0003_total_shipment_count_weight_item(
+                    dicItems[pszItem], pszItem
+                )
+                if not arrOutputFields:
+                    arrOutputHeader = arrHeader[:4]
+                    arrOutputFields = arrFields[:4]
+                elif arrFields[:4] != arrOutputFields[:4]:
+                    raise_conversion_error(
+                        "STEP0003_TOTAL_COMMON_COLUMNS_MISMATCH",
+                        "common columns do not match. Path = " + dicItems[pszItem],
+                    )
+                arrOutputHeader.append(arrHeader[4])
+                arrOutputFields.append(arrFields[4])
+            pszOutputPath = create_step0004_total_shipment_count_weight_output_path(
+                dicItems[STEP0004_TOTAL_SHIPMENT_COUNT_WEIGHT_ITEMS[0]]
+            )
+            write_step0004_tsv(
+                pszOutputPath, "\t".join(arrOutputHeader), "\t".join(arrOutputFields)
+            )
+            arrCreatedPaths.append(pszOutputPath)
+            arrYearMonths.append((objKey[2], objKey[3]))
+        return arrCreatedPaths, arrYearMonths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0004_TOTAL_SHIPMENT_COUNT_WEIGHT_CLEANUP_FAILED",
+                "shipment count/weight combination failed. Original error = " + str(objException)
+                + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0004_output_path(
+    pszSourceTsvPath: str,
+    pszGroupName: str,
+    iYear: int,
+    iMonth: int,
+) -> str:
+    pszDirectory: str = os.path.dirname(pszSourceTsvPath)
+    pszBaseName: str = os.path.splitext(os.path.basename(pszSourceTsvPath))[0]
+    pszStem: str = (
+        f"{pszBaseName}_step0004_グループ別_{pszGroupName}_{iYear:04d}_{iMonth:02d}"
+    )
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def write_step0004_tsv(
+    pszOutputPath: str, pszHeader: str, pszRow: str
+) -> None:
+    try:
+        write_monthly_tsv(pszOutputPath, pszHeader, [pszRow])
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0004_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0004_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0004_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0004_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0004_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def build_step0003_path_map(
+    arrStep0003Paths: List[str], arrStep0003YearMonths: List[Tuple[int, int]]
+) -> Dict[Tuple[int, int, str], str]:
+    iExpectedCount: int = len(arrStep0003YearMonths) * len(STEP0003_ITEMS)
+    if len(arrStep0003Paths) != iExpectedCount:
+        raise_conversion_error(
+            "INVALID_STEP0003_PATH_COUNT",
+            "step0003 path count did not match year/month and item counts. Expected = "
+            + str(iExpectedCount)
+            + ", Actual = "
+            + str(len(arrStep0003Paths)),
+        )
+    dicPaths: Dict[Tuple[int, int, str], str] = {}
+    iPathIndex: int = 0
+    for iYear, iMonth in arrStep0003YearMonths:
+        for pszItemName, _, _, _ in STEP0003_ITEMS:
+            objKey: Tuple[int, int, str] = (iYear, iMonth, pszItemName)
+            if objKey in dicPaths:
+                raise_conversion_error(
+                    "DUPLICATE_STEP0003_PATH_KEY",
+                    "duplicate step0003 path key. Key = " + str(objKey),
+                )
+            dicPaths[objKey] = arrStep0003Paths[iPathIndex]
+            iPathIndex += 1
+    return dicPaths
+
+
+def read_step0003_for_step0004(
+    pszInputPath: str,
+    pszExpectedItemName: str,
+    bAllowBlank: bool,
+    iExpectedYear: int,
+    iExpectedMonth: int,
+) -> Dict[Tuple[str, str], List[str]]:
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0003_READ_FAILED",
+            "failed to read step0003 TSV. Path = "
+            + pszInputPath
+            + ", Detail = "
+            + str(objException),
+        )
+    if len(arrLines) != 4:
+        raise_conversion_error(
+            "INVALID_STEP0003_ROW_COUNT",
+            "step0003 must contain one header and three data rows. Path = "
+            + pszInputPath
+            + ", Actual rows = "
+            + str(len(arrLines)),
+        )
+    arrHeader: List[str] = arrLines[0].split("\t")
+    arrExpectedHeader: List[str] = [
+        "年",
+        "月",
+        "ｸﾞﾙｰﾌﾟ№",
+        "ｸﾞﾙｰﾌﾟ名",
+        pszExpectedItemName,
+    ]
+    if len(arrHeader) != 5 or [
+        pszValue.strip(" \u3000\t") for pszValue in arrHeader
+    ] != arrExpectedHeader:
+        raise_conversion_error(
+            "INVALID_STEP0003_HEADER",
+            "unexpected step0003 header. Path = "
+            + pszInputPath
+            + ", Expected = "
+            + " | ".join(arrExpectedHeader)
+            + ", Actual = "
+            + " | ".join(arrHeader),
+        )
+
+    dicExpectedGroups: Dict[str, str] = {
+        pszNumber: pszName for pszNumber, pszName in GROUPS
+    }
+    dicRows: Dict[Tuple[str, str], List[str]] = {}
+    for iLineNumber, pszLine in enumerate(arrLines[1:], start=2):
+        arrFields: List[str] = pszLine.split("\t")
+        if len(arrFields) != 5:
+            raise_conversion_error(
+                "INVALID_STEP0003_COLUMN_COUNT",
+                "step0003 row must contain 5 columns. Path = "
+                + pszInputPath
+                + ", Line = "
+                + str(iLineNumber)
+                + ", Actual = "
+                + str(len(arrFields)),
+            )
+        iYear, iMonth = parse_year_month(arrFields[0], arrFields[1], iLineNumber)
+        if (iYear, iMonth) != (iExpectedYear, iExpectedMonth):
+            raise_conversion_error(
+                "INVALID_STEP0003_YEAR_MONTH",
+                "unexpected step0003 year/month. Path = "
+                + pszInputPath
+                + ", Line = "
+                + str(iLineNumber),
+            )
+        pszGroupNumber: str = arrFields[2].strip(" \u3000\t")
+        pszGroupName: str = arrFields[3].strip(" \u3000\t")
+        if dicExpectedGroups.get(pszGroupNumber) != pszGroupName:
+            raise_conversion_error(
+                "INVALID_STEP0003_GROUP",
+                "unexpected step0003 group mapping. Path = "
+                + pszInputPath
+                + ", Line = "
+                + str(iLineNumber),
+            )
+        objGroupKey: Tuple[str, str] = (pszGroupNumber, pszGroupName)
+        if objGroupKey in dicRows:
+            raise_conversion_error(
+                "INVALID_STEP0003_GROUP",
+                "duplicate step0003 group. Path = "
+                + pszInputPath
+                + ", Group = "
+                + str(objGroupKey),
+            )
+        try:
+            objValue = parse_decimal_value(
+                arrFields[4], iLineNumber, 4, pszExpectedItemName
+            )
+        except ConversionError as objException:
+            raise_conversion_error(
+                "INVALID_STEP0003_ITEM_VALUE",
+                "invalid step0003 item value. Path = "
+                + pszInputPath
+                + ", Item = "
+                + pszExpectedItemName
+                + ". Detail = "
+                + str(objException),
+            )
+        if objValue is None and not bAllowBlank:
+            raise_conversion_error(
+                "INVALID_STEP0003_ITEM_VALUE",
+                "step0003 item value was blank. Path = "
+                + pszInputPath
+                + ", Item = "
+                + pszExpectedItemName
+                + ", Line = "
+                + str(iLineNumber),
+            )
+        dicRows[objGroupKey] = arrFields
+
+    setExpectedGroups = set(dicExpectedGroups.items())
+    if set(dicRows) != setExpectedGroups:
+        raise_conversion_error(
+            "INVALID_STEP0003_GROUP",
+            "step0003 groups were missing or unexpected. Path = " + pszInputPath,
+        )
+    return dicRows
+
+
+def create_step0004_files(
+    pszSourceTsvPath: str,
+    arrStep0003Paths: List[str],
+    arrStep0003YearMonths: List[Tuple[int, int]],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    dicStep0003Paths = build_step0003_path_map(
+        arrStep0003Paths, arrStep0003YearMonths
+    )
+    arrCreatedPaths: List[str] = []
+    try:
+        for iYear, iMonth in arrStep0003YearMonths:
+            dicItemRows: Dict[str, Dict[Tuple[str, str], List[str]]] = {}
+            for pszItemName, bAllowBlank in STEP0004_ITEMS:
+                objPathKey: Tuple[int, int, str] = (iYear, iMonth, pszItemName)
+                if objPathKey not in dicStep0003Paths:
+                    raise_conversion_error(
+                        "STEP0003_INPUT_MISSING",
+                        "required step0003 input was missing. Key = "
+                        + str(objPathKey),
+                    )
+                pszInputPath: str = dicStep0003Paths[objPathKey]
+                dicItemRows[pszItemName] = read_step0003_for_step0004(
+                    pszInputPath,
+                    pszItemName,
+                    bAllowBlank,
+                    iYear,
+                    iMonth,
+                )
+
+            for pszGroupNumber, pszGroupName in GROUPS:
+                objGroupKey: Tuple[str, str] = (pszGroupNumber, pszGroupName)
+                arrCommonFields: List[str] = dicItemRows[STEP0004_ITEMS[0][0]][
+                    objGroupKey
+                ][:4]
+                for pszItemName, _ in STEP0004_ITEMS[1:]:
+                    if dicItemRows[pszItemName][objGroupKey][:4] != arrCommonFields:
+                        raise_conversion_error(
+                            "STEP0003_GROUP_KEY_MISMATCH",
+                            "step0003 group keys did not match. Year/month = "
+                            + f"{iYear:04d}_{iMonth:02d}"
+                            + ", Group = "
+                            + str(objGroupKey)
+                            + ", Item = "
+                            + pszItemName,
+                        )
+                arrOutputFields: List[str] = arrCommonFields + [
+                    dicItemRows[pszItemName][objGroupKey][4]
+                    for pszItemName, _ in STEP0004_ITEMS
+                ]
+                pszOutputPath: str = create_step0004_output_path(
+                    pszSourceTsvPath,
+                    pszGroupName,
+                    iYear,
+                    iMonth,
+                )
+                write_step0004_tsv(
+                    pszOutputPath,
+                    STEP0004_HEADER,
+                    "\t".join(arrOutputFields),
+                )
+                arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths, list(arrStep0003YearMonths)
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0004_CLEANUP_FAILED",
+                "step0004 creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0005_output_path(
+    pszSourceTsvPath: str, pszGroupName: str, iYear: int
+) -> str:
+    pszDirectory: str = os.path.dirname(pszSourceTsvPath)
+    pszBaseName: str = os.path.splitext(os.path.basename(pszSourceTsvPath))[0]
+    pszStem: str = f"{pszBaseName}_step0005_グループ別_{pszGroupName}_{iYear:04d}_年間"
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def write_step0005_tsv(
+    pszOutputPath: str, pszHeader: str, arrRows: List[str]
+) -> None:
+    try:
+        write_monthly_tsv(pszOutputPath, pszHeader, arrRows)
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0005_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0005_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0005_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0005_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0005_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def build_step0004_path_map(
+    arrStep0004Paths: List[str], arrStep0004YearMonths: List[Tuple[int, int]]
+) -> Dict[Tuple[int, int, str, str], str]:
+    iExpectedCount: int = len(arrStep0004YearMonths) * len(GROUPS)
+    if len(arrStep0004Paths) != iExpectedCount:
+        raise_conversion_error(
+            "INVALID_STEP0004_PATH_COUNT",
+            "step0004 path count did not match year/month and group counts. Expected = "
+            + str(iExpectedCount)
+            + ", Actual = "
+            + str(len(arrStep0004Paths)),
+        )
+    dicPaths: Dict[Tuple[int, int, str, str], str] = {}
+    iPathIndex: int = 0
+    for iYear, iMonth in arrStep0004YearMonths:
+        for pszGroupNumber, pszGroupName in GROUPS:
+            objKey: Tuple[int, int, str, str] = (
+                iYear,
+                iMonth,
+                pszGroupNumber,
+                pszGroupName,
+            )
+            if objKey in dicPaths:
+                raise_conversion_error(
+                    "DUPLICATE_STEP0004_YEAR_MONTH_GROUP",
+                    "duplicate step0004 year/month/group key. Key = " + str(objKey),
+                )
+            dicPaths[objKey] = arrStep0004Paths[iPathIndex]
+            iPathIndex += 1
+    return dicPaths
+
+
+def read_step0004_for_step0005(
+    pszInputPath: str,
+    iExpectedYear: int,
+    iExpectedMonth: int,
+    pszExpectedGroupNumber: str,
+    pszExpectedGroupName: str,
+) -> Tuple[str, str]:
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0004_READ_FAILED",
+            "failed to read step0004 TSV. Path = "
+            + pszInputPath
+            + ", Detail = "
+            + str(objException),
+        )
+    if len(arrLines) != 2:
+        raise_conversion_error(
+            "INVALID_STEP0004_ROW_COUNT",
+            "step0004 must contain one header and one data row. Path = "
+            + pszInputPath
+            + ", Actual rows = "
+            + str(len(arrLines)),
+        )
+    arrHeader: List[str] = arrLines[0].split("\t")
+    arrExpectedHeader: List[str] = STEP0004_HEADER.split("\t")
+    if len(arrHeader) != 8 or [
+        pszValue.strip(" \u3000\t") for pszValue in arrHeader
+    ] != arrExpectedHeader:
+        raise_conversion_error(
+            "INVALID_STEP0004_HEADER",
+            "unexpected step0004 header. Path = "
+            + pszInputPath
+            + ", Expected = "
+            + " | ".join(arrExpectedHeader)
+            + ", Actual = "
+            + " | ".join(arrHeader),
+        )
+    arrFields: List[str] = arrLines[1].split("\t")
+    if len(arrFields) != 8:
+        raise_conversion_error(
+            "INVALID_STEP0004_COLUMN_COUNT",
+            "step0004 data row must contain 8 columns. Path = "
+            + pszInputPath
+            + ", Actual = "
+            + str(len(arrFields)),
+        )
+    iYear, iMonth = parse_year_month(arrFields[0], arrFields[1], 2)
+    if (iYear, iMonth) != (iExpectedYear, iExpectedMonth):
+        raise_conversion_error(
+            "INVALID_STEP0004_YEAR_MONTH",
+            "unexpected step0004 year/month. Path = " + pszInputPath,
+        )
+    pszGroupNumber: str = arrFields[2].strip(" \u3000\t")
+    pszGroupName: str = arrFields[3].strip(" \u3000\t")
+    if (pszGroupNumber, pszGroupName) != (
+        pszExpectedGroupNumber,
+        pszExpectedGroupName,
+    ):
+        raise_conversion_error(
+            "INVALID_STEP0004_GROUP",
+            "unexpected step0004 group. Path = " + pszInputPath,
+        )
+    for iColumnIndex, (pszItemName, bAllowBlank) in enumerate(
+        STEP0004_ITEMS, start=4
+    ):
+        try:
+            objValue = parse_decimal_value(
+                arrFields[iColumnIndex], 2, iColumnIndex, pszItemName
+            )
+        except ConversionError as objException:
+            raise_conversion_error(
+                "INVALID_STEP0004_ITEM_VALUE",
+                "invalid step0004 item value. Path = "
+                + pszInputPath
+                + ", Item = "
+                + pszItemName
+                + ". Detail = "
+                + str(objException),
+            )
+        if objValue is None and not bAllowBlank:
+            raise_conversion_error(
+                "INVALID_STEP0004_ITEM_VALUE",
+                "step0004 item value was blank. Path = "
+                + pszInputPath
+                + ", Item = "
+                + pszItemName,
+            )
+    return arrLines[0], arrLines[1]
+
+
+def create_step0005_files(
+    pszSourceTsvPath: str,
+    arrStep0004Paths: List[str],
+    arrStep0004YearMonths: List[Tuple[int, int]],
+) -> Tuple[List[str], List[int]]:
+    dicStep0004Paths = build_step0004_path_map(
+        arrStep0004Paths, arrStep0004YearMonths
+    )
+    arrYears: List[int] = sorted({iYear for iYear, _ in arrStep0004YearMonths})
+    arrCreatedPaths: List[str] = []
+    try:
+        for iYear in arrYears:
+            arrMonths: List[int] = sorted(
+                {
+                    iMonth
+                    for iTargetYear, iMonth in arrStep0004YearMonths
+                    if iTargetYear == iYear
+                }
+            )
+            for pszGroupNumber, pszGroupName in GROUPS:
+                pszCommonHeader: str = ""
+                arrRows: List[str] = []
+                for iMonth in arrMonths:
+                    objPathKey: Tuple[int, int, str, str] = (
+                        iYear,
+                        iMonth,
+                        pszGroupNumber,
+                        pszGroupName,
+                    )
+                    if objPathKey not in dicStep0004Paths:
+                        raise_conversion_error(
+                            "STEP0004_INPUT_MISSING",
+                            "required step0004 input was missing. Key = "
+                            + str(objPathKey),
+                        )
+                    pszHeader, pszRow = read_step0004_for_step0005(
+                        dicStep0004Paths[objPathKey],
+                        iYear,
+                        iMonth,
+                        pszGroupNumber,
+                        pszGroupName,
+                    )
+                    if not pszCommonHeader:
+                        pszCommonHeader = pszHeader
+                    elif pszHeader != pszCommonHeader:
+                        raise_conversion_error(
+                            "INVALID_STEP0004_HEADER",
+                            "step0004 headers did not match within annual group. Year = "
+                            + str(iYear)
+                            + ", Group = "
+                            + pszGroupName,
+                        )
+                    arrRows.append(pszRow)
+                if not arrRows:
+                    continue
+                pszOutputPath: str = create_step0005_output_path(
+                    pszSourceTsvPath, pszGroupName, iYear
+                )
+                write_step0005_tsv(pszOutputPath, pszCommonHeader, arrRows)
+                arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths, arrYears
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0005_CLEANUP_FAILED",
+                "step0005 creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0006_output_path(pszStep0005Path: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0005Path)
+    pszFileName: str = os.path.basename(pszStep0005Path)
+    if "_step0005_" not in pszFileName:
+        raise_conversion_error(
+            "INVALID_STEP0005_FILENAME",
+            "step0005 file name did not contain the expected marker. Path = "
+            + pszStep0005Path,
+        )
+    pszStep0006FileName: str = pszFileName.replace(
+        "_step0005_", "_step0006_", 1
+    )
+    pszStem, pszExtension = os.path.splitext(pszStep0006FileName)
+    pszOutputPath: str = os.path.join(pszDirectory, pszStep0006FileName)
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}{pszExtension}"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0005_for_step0006(pszInputPath: str) -> List[List[str]]:
+    objFileNameMatch = re.search(
+        r"_step0005_グループ別_(契約|直営|フリー)_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0005_FILENAME",
+            "unexpected step0005 file name. Path = " + pszInputPath,
+        )
+    pszExpectedGroupName: str = objFileNameMatch.group(1)
+    iExpectedYear: int = int(objFileNameMatch.group(2))
+    dicExpectedGroups: Dict[str, str] = {
+        pszGroupName: pszGroupNumber for pszGroupNumber, pszGroupName in GROUPS
+    }
+    pszExpectedGroupNumber: str = dicExpectedGroups[pszExpectedGroupName]
+
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows: List[List[str]] = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0005_READ_FAILED",
+            "failed to read step0005 TSV. Path = "
+            + pszInputPath
+            + ", Detail = "
+            + str(objException),
+        )
+    if len(arrRows) < 2:
+        raise_conversion_error(
+            "INVALID_STEP0005_ROW_COUNT",
+            "step0005 must contain one header and at least one data row. Path = "
+            + pszInputPath,
+        )
+    arrExpectedHeader: List[str] = STEP0004_HEADER.split("\t")
+    if [pszValue.strip(" \u3000\t") for pszValue in arrRows[0]] != arrExpectedHeader:
+        raise_conversion_error(
+            "INVALID_STEP0005_HEADER",
+            "unexpected step0005 header. Path = " + pszInputPath,
+        )
+
+    iPreviousMonth: int = 0
+    setMonths = set()
+    for iLineNumber, arrFields in enumerate(arrRows[1:], start=2):
+        if len(arrFields) != len(arrExpectedHeader):
+            raise_conversion_error(
+                "INVALID_STEP0005_COLUMN_COUNT",
+                "step0005 row must contain 8 columns. Path = "
+                + pszInputPath
+                + ", Line = "
+                + str(iLineNumber)
+                + ", Actual = "
+                + str(len(arrFields)),
+            )
+        iYear, iMonth = parse_year_month(
+            arrFields[0], arrFields[1], iLineNumber
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0005_YEAR",
+                "step0005 year did not match its file name. Path = "
+                + pszInputPath
+                + ", Line = "
+                + str(iLineNumber),
+            )
+        if iMonth in setMonths:
+            raise_conversion_error(
+                "DUPLICATE_STEP0005_MONTH",
+                "duplicate month in step0005. Path = "
+                + pszInputPath
+                + ", Month = "
+                + str(iMonth),
+            )
+        if iMonth <= iPreviousMonth:
+            raise_conversion_error(
+                "INVALID_STEP0005_MONTH_ORDER",
+                "step0005 months were not in ascending order. Path = "
+                + pszInputPath,
+            )
+        setMonths.add(iMonth)
+        iPreviousMonth = iMonth
+        if (
+            arrFields[2].strip(" \u3000\t") != pszExpectedGroupNumber
+            or arrFields[3].strip(" \u3000\t") != pszExpectedGroupName
+        ):
+            raise_conversion_error(
+                "INVALID_STEP0005_GROUP",
+                "step0005 group did not match its file name. Path = "
+                + pszInputPath
+                + ", Line = "
+                + str(iLineNumber),
+            )
+        for iColumnIndex, (pszItemName, bAllowBlank) in enumerate(
+            STEP0004_ITEMS, start=4
+        ):
+            try:
+                objValue = parse_decimal_value(
+                    arrFields[iColumnIndex],
+                    iLineNumber,
+                    iColumnIndex,
+                    pszItemName,
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "INVALID_STEP0005_ITEM_VALUE",
+                    "invalid step0005 item value. Path = "
+                    + pszInputPath
+                    + ", Line = "
+                    + str(iLineNumber)
+                    + ", Item = "
+                    + pszItemName
+                    + ". Detail = "
+                    + str(objException),
+                )
+            if objValue is None and not bAllowBlank:
+                raise_conversion_error(
+                    "INVALID_STEP0005_ITEM_VALUE",
+                    "step0005 item value was blank. Path = "
+                    + pszInputPath
+                    + ", Line = "
+                    + str(iLineNumber)
+                    + ", Item = "
+                    + pszItemName,
+                )
+    return arrRows
+
+
+def transpose_tsv_rows(arrRows: List[List[str]]) -> List[List[str]]:
+    if not arrRows:
+        raise_conversion_error(
+            "INVALID_STEP0005_ROW_COUNT", "step0005 did not contain any rows."
+        )
+    iColumnCount: int = len(arrRows[0])
+    if any(len(arrRow) != iColumnCount for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0005_COLUMN_COUNT",
+            "step0005 rows did not have a consistent column count.",
+        )
+    return [
+        [arrRows[iRowIndex][iColumnIndex] for iRowIndex in range(len(arrRows))]
+        for iColumnIndex in range(iColumnCount)
+    ]
+
+
+def write_step0006_tsv(
+    pszOutputPath: str, arrRows: List[List[str]]
+) -> None:
+    if not arrRows:
+        raise_conversion_error(
+            "INVALID_STEP0006_ROW_COUNT", "step0006 did not contain any rows."
+        )
+    try:
+        write_monthly_tsv(
+            pszOutputPath,
+            "\t".join(arrRows[0]),
+            ["\t".join(arrRow) for arrRow in arrRows[1:]],
+        )
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0006_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0006_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0006_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0006_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0006_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def create_step0006_files(arrStep0005Paths: List[str]) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0005Path in arrStep0005Paths:
+            arrInputRows: List[List[str]] = read_step0005_for_step0006(
+                pszStep0005Path
+            )
+            arrTransposedRows: List[List[str]] = transpose_tsv_rows(arrInputRows)
+            pszOutputPath: str = create_step0006_output_path(pszStep0005Path)
+            write_step0006_tsv(pszOutputPath, arrTransposedRows)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0006_CLEANUP_FAILED",
+                "step0006 creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0007_output_path(pszSourceTsvPath: str, iYear: int) -> str:
+    pszDirectory: str = os.path.dirname(pszSourceTsvPath)
+    pszBaseName: str = os.path.splitext(os.path.basename(pszSourceTsvPath))[0]
+    pszStem: str = f"{pszBaseName}_step0007_グループ別_{iYear:04d}_年間"
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def parse_step0006_file_name(pszStep0006Path: str) -> Tuple[int, str]:
+    objMatch = re.search(
+        r"_step0006_グループ別_(契約|直営|フリー)_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszStep0006Path),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0006_FILENAME",
+            "unexpected step0006 file name. Path = " + pszStep0006Path,
+        )
+    return int(objMatch.group(2)), objMatch.group(1)
+
+
+def read_step0006_for_step0007(
+    pszInputPath: str, iExpectedYear: int, pszExpectedGroupName: str
+) -> Dict[str, List[str]]:
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows: List[List[str]] = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0006_READ_FAILED",
+            "failed to read step0006 TSV. Path = "
+            + pszInputPath
+            + ", Detail = "
+            + str(objException),
+        )
+    arrExpectedRowHeaders: List[str] = STEP0004_HEADER.split("\t")
+    if len(arrRows) != len(arrExpectedRowHeaders):
+        raise_conversion_error(
+            "INVALID_STEP0006_ROW_COUNT",
+            "step0006 must contain 8 rows. Path = "
+            + pszInputPath
+            + ", Actual = "
+            + str(len(arrRows)),
+        )
+    iColumnCount: int = len(arrRows[0])
+    if iColumnCount < 2 or any(len(arrRow) != iColumnCount for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0006_COLUMN_COUNT",
+            "step0006 rows must have an equal column count and at least one data column. Path = "
+            + pszInputPath,
+        )
+    arrActualRowHeaders: List[str] = [
+        arrRow[0].strip(" \u3000\t") for arrRow in arrRows
+    ]
+    if arrActualRowHeaders != arrExpectedRowHeaders:
+        raise_conversion_error(
+            "INVALID_STEP0006_ROW_HEADER",
+            "unexpected step0006 row headers. Path = " + pszInputPath,
+        )
+    dicRows: Dict[str, List[str]] = {
+        arrRow[0].strip(" \u3000\t"): arrRow[1:] for arrRow in arrRows
+    }
+    dicExpectedGroups: Dict[str, str] = {
+        pszGroupName: pszGroupNumber for pszGroupNumber, pszGroupName in GROUPS
+    }
+    pszExpectedGroupNumber: str = dicExpectedGroups[pszExpectedGroupName]
+    arrMonths: List[int] = []
+    for iValueIndex in range(iColumnCount - 1):
+        iLineNumber: int = iValueIndex + 2
+        iYear, iMonth = parse_year_month(
+            dicRows["年"][iValueIndex], dicRows["月"][iValueIndex], iLineNumber
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0006_YEAR",
+                "step0006 year did not match its file name. Path = "
+                + pszInputPath
+                + ", Column = "
+                + str(iValueIndex + 2),
+            )
+        if iMonth in arrMonths:
+            raise_conversion_error(
+                "DUPLICATE_STEP0006_MONTH",
+                "duplicate month in step0006. Path = "
+                + pszInputPath
+                + ", Month = "
+                + str(iMonth),
+            )
+        if arrMonths and iMonth <= arrMonths[-1]:
+            raise_conversion_error(
+                "INVALID_STEP0006_MONTH",
+                "step0006 months were not in ascending order. Path = "
+                + pszInputPath,
+            )
+        arrMonths.append(iMonth)
+        if (
+            dicRows["ｸﾞﾙｰﾌﾟ№"][iValueIndex].strip(" \u3000\t")
+            != pszExpectedGroupNumber
+            or dicRows["ｸﾞﾙｰﾌﾟ名"][iValueIndex].strip(" \u3000\t")
+            != pszExpectedGroupName
+        ):
+            raise_conversion_error(
+                "INVALID_STEP0006_GROUP",
+                "step0006 group did not match its file name. Path = "
+                + pszInputPath
+                + ", Column = "
+                + str(iValueIndex + 2),
+            )
+        for pszItemName, bAllowBlank in STEP0004_ITEMS:
+            try:
+                objValue = parse_decimal_value(
+                    dicRows[pszItemName][iValueIndex],
+                    iLineNumber,
+                    arrExpectedRowHeaders.index(pszItemName),
+                    pszItemName,
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "INVALID_STEP0006_ITEM_VALUE",
+                    "invalid step0006 item value. Path = "
+                    + pszInputPath
+                    + ", Item = "
+                    + pszItemName
+                    + ". Detail = "
+                    + str(objException),
+                )
+            if objValue is None and not bAllowBlank:
+                raise_conversion_error(
+                    "INVALID_STEP0006_ITEM_VALUE",
+                    "step0006 item value was blank. Path = "
+                    + pszInputPath
+                    + ", Item = "
+                    + pszItemName
+                    + ", Column = "
+                    + str(iValueIndex + 2),
+                )
+    dicRows["月"] = [f"{iMonth:02d}" for iMonth in arrMonths]
+    return dicRows
+
+
+def format_step0007_average_weight(pszValue: str) -> str:
+    pszNormalizedValue: str = pszValue.strip(" \u3000\t")
+    if pszNormalizedValue == "":
+        return ""
+    try:
+        objValue = Decimal(pszNormalizedValue)
+    except InvalidOperation:
+        objValue = Decimal("NaN")
+    if not objValue.is_finite():
+        raise_conversion_error(
+            "INVALID_STEP0006_ITEM_VALUE",
+            "average weight was not a finite number. Value = " + pszValue,
+        )
+    return format(
+        objValue.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP), ".3f"
+    )
+
+
+def create_step0007_group_rows(
+    pszGroupName: str, dicStep0006Rows: Dict[str, List[str]]
+) -> List[str]:
+    arrOutputRows: List[str] = []
+    for iItemIndex, (pszItemName, _) in enumerate(STEP0004_ITEMS):
+        arrValues: List[str] = list(dicStep0006Rows[pszItemName])
+        if pszItemName == "平均体重":
+            arrValues = [
+                format_step0007_average_weight(pszValue) for pszValue in arrValues
+            ]
+        arrOutputRows.append(
+            "\t".join(
+                ([pszGroupName if iItemIndex == 0 else "", pszItemName] + arrValues)
+            )
+        )
+    return arrOutputRows
+
+
+def write_step0007_tsv(pszOutputPath: str, arrRows: List[str]) -> None:
+    if not arrRows:
+        raise_conversion_error(
+            "INVALID_STEP0007_ROW_COUNT", "step0007 did not contain any rows."
+        )
+    try:
+        write_monthly_tsv(pszOutputPath, arrRows[0], arrRows[1:])
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0007_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0007_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0007_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0007_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0007_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def create_step0007_files(
+    pszSourceTsvPath: str, arrStep0006Paths: List[str]
+) -> Tuple[List[str], List[int]]:
+    dicPaths: Dict[Tuple[int, str], str] = {}
+    for pszPath in arrStep0006Paths:
+        iYear, pszGroupName = parse_step0006_file_name(pszPath)
+        objKey: Tuple[int, str] = (iYear, pszGroupName)
+        if objKey in dicPaths:
+            raise_conversion_error(
+                "DUPLICATE_STEP0006_YEAR_GROUP",
+                "duplicate step0006 year/group. Key = " + str(objKey),
+            )
+        dicPaths[objKey] = pszPath
+    arrYears: List[int] = sorted({iYear for iYear, _ in dicPaths})
+    arrCreatedPaths: List[str] = []
+    try:
+        for iYear in arrYears:
+            dicGroupRows: Dict[str, Dict[str, List[str]]] = {}
+            for _, pszGroupName in GROUPS:
+                objKey = (iYear, pszGroupName)
+                if objKey not in dicPaths:
+                    raise_conversion_error(
+                        "MISSING_STEP0006_GROUP",
+                        "required step0006 group was missing. Key = " + str(objKey),
+                    )
+                dicGroupRows[pszGroupName] = read_step0006_for_step0007(
+                    dicPaths[objKey], iYear, pszGroupName
+                )
+            arrReferenceMonths: List[str] = dicGroupRows[GROUPS[0][1]]["月"]
+            for _, pszGroupName in GROUPS[1:]:
+                if dicGroupRows[pszGroupName]["月"] != arrReferenceMonths:
+                    raise_conversion_error(
+                        "STEP0006_MONTH_MISMATCH",
+                        "step0006 month columns did not match between groups. Year = "
+                        + str(iYear)
+                        + ", Group = "
+                        + pszGroupName,
+                    )
+            iMonthCount: int = len(arrReferenceMonths)
+            arrRows: List[str] = [
+                "\t".join(["", "年"] + [f"{iYear:04d}"] * iMonthCount),
+                "\t".join(["", "月"] + arrReferenceMonths),
+            ]
+            for _, pszGroupName in GROUPS:
+                arrRows.extend(
+                    create_step0007_group_rows(
+                        pszGroupName, dicGroupRows[pszGroupName]
+                    )
+                )
+            arrAdditionalMonths: List[str] = [
+                f"{iMonth:02d}" for iMonth in range(int(arrReferenceMonths[-1]) + 1, 13)
+            ]
+            if arrAdditionalMonths:
+                dicFillValues: Dict[str, str] = {
+                    "入雛羽数": "0",
+                    "出荷羽数": "0",
+                    "正味重量": "0.0",
+                    "平均体重": "0.000",
+                }
+                for iRowIndex, pszRow in enumerate(arrRows):
+                    pszItemName: str = pszRow.split("\t")[1]
+                    if pszItemName == "年":
+                        arrAdditionalValues = [f"{iYear:04d}"] * len(arrAdditionalMonths)
+                    elif pszItemName == "月":
+                        arrAdditionalValues = arrAdditionalMonths
+                    else:
+                        arrAdditionalValues = [dicFillValues[pszItemName]] * len(arrAdditionalMonths)
+                    arrRows[iRowIndex] = pszRow + "\t" + "\t".join(arrAdditionalValues)
+            pszOutputPath: str = create_step0007_output_path(
+                pszSourceTsvPath, iYear
+            )
+            write_step0007_tsv(pszOutputPath, arrRows)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths, arrYears
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0007_CLEANUP_FAILED",
+                "step0007 creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0007_excel_output_path(pszStep0007TsvPath: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0007TsvPath)
+    pszStem: str = os.path.splitext(os.path.basename(pszStep0007TsvPath))[0]
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".xlsx")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.xlsx"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0007_for_excel(
+    pszInputPath: str,
+) -> Tuple[List[List[str]], int]:
+    objFileNameMatch = re.search(
+        r"_step0007_グループ別_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0007_FILENAME",
+            "unexpected step0007 file name. Path = " + pszInputPath,
+        )
+    iExpectedYear: int = int(objFileNameMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows: List[List[str]] = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0007_TSV_READ_FAILED",
+            "failed to read step0007 TSV. Path = "
+            + pszInputPath
+            + ", Detail = "
+            + str(objException),
+        )
+    arrExpectedStructure: List[Tuple[str, str]] = [
+        ("", "年"),
+        ("", "月"),
+        ("契約", "入雛羽数"),
+        ("", "出荷羽数"),
+        ("", "正味重量"),
+        ("", "平均体重"),
+        ("直営", "入雛羽数"),
+        ("", "出荷羽数"),
+        ("", "正味重量"),
+        ("", "平均体重"),
+        ("フリー", "入雛羽数"),
+        ("", "出荷羽数"),
+        ("", "正味重量"),
+        ("", "平均体重"),
+    ]
+    if len(arrRows) != len(arrExpectedStructure):
+        raise_conversion_error(
+            "INVALID_STEP0007_ROW_COUNT",
+            "step0007 must contain 14 rows. Path = "
+            + pszInputPath
+            + ", Actual = "
+            + str(len(arrRows)),
+        )
+    iColumnCount: int = len(arrRows[0])
+    if iColumnCount < 3 or any(len(arrRow) != iColumnCount for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0007_COLUMN_COUNT",
+            "step0007 rows must have an equal column count and at least one data column. Path = "
+            + pszInputPath,
+        )
+    for iRowIndex, objExpected in enumerate(arrExpectedStructure):
+        objActual: Tuple[str, str] = (
+            arrRows[iRowIndex][0].strip(" \u3000\t"),
+            arrRows[iRowIndex][1].strip(" \u3000\t"),
+        )
+        if objActual != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0007_ROW_STRUCTURE",
+                "unexpected step0007 row structure. Path = "
+                + pszInputPath
+                + ", Line = "
+                + str(iRowIndex + 1),
+            )
+
+    arrMonths: List[int] = []
+    for iColumnIndex in range(2, iColumnCount):
+        iYear, iMonth = parse_year_month(
+            arrRows[0][iColumnIndex],
+            arrRows[1][iColumnIndex],
+            iColumnIndex + 1,
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0007_YEAR",
+                "step0007 year did not match its file name. Path = "
+                + pszInputPath
+                + ", Column = "
+                + str(iColumnIndex + 1),
+            )
+        if iMonth in arrMonths or (arrMonths and iMonth <= arrMonths[-1]):
+            raise_conversion_error(
+                "INVALID_STEP0007_MONTH",
+                "step0007 months must be unique and ascending. Path = "
+                + pszInputPath,
+            )
+        arrMonths.append(iMonth)
+        for iRowIndex in range(2, len(arrRows)):
+            pszItemName: str = arrRows[iRowIndex][1].strip(" \u3000\t")
+            bAllowBlank: bool = pszItemName == "平均体重"
+            try:
+                objValue = parse_decimal_value(
+                    arrRows[iRowIndex][iColumnIndex],
+                    iRowIndex + 1,
+                    iColumnIndex,
+                    pszItemName,
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "INVALID_STEP0007_ITEM_VALUE",
+                    "invalid step0007 item value. Path = "
+                    + pszInputPath
+                    + ", Line = "
+                    + str(iRowIndex + 1)
+                    + ", Column = "
+                    + str(iColumnIndex + 1)
+                    + ". Detail = "
+                    + str(objException),
+                )
+            if objValue is None and not bAllowBlank:
+                raise_conversion_error(
+                    "INVALID_STEP0007_ITEM_VALUE",
+                    "step0007 item value was blank. Path = "
+                    + pszInputPath
+                    + ", Line = "
+                    + str(iRowIndex + 1)
+                    + ", Column = "
+                    + str(iColumnIndex + 1),
+                )
+    return arrRows, iExpectedYear
+
+
+def convert_step0007_excel_numeric_value(pszValue: str) -> Optional[Any]:
+    pszNormalizedValue: str = pszValue.strip(" \u3000\t")
+    if pszNormalizedValue == "":
+        return None
+    try:
+        objValue = Decimal(pszNormalizedValue)
+    except InvalidOperation:
+        objValue = Decimal("NaN")
+    if not objValue.is_finite():
+        raise_conversion_error(
+            "INVALID_STEP0007_ITEM_VALUE",
+            "step0007 value was not a finite number. Value = " + pszValue,
+        )
+    if objValue == objValue.to_integral_value():
+        return int(objValue)
+    return float(objValue)
+
+
+def write_step0007_excel(
+    pszOutputPath: str, arrRows: List[List[str]]
+) -> None:
+    pszTemporaryPath: str = ""
+    bOutputReserved: bool = False
+    objWorkbook: Optional[Workbook] = None
+    try:
+        try:
+            iFileDescriptor: int = os.open(
+                pszOutputPath, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.close(iFileDescriptor)
+            bOutputReserved = True
+        except FileExistsError:
+            raise_conversion_error(
+                "STEP0007_EXCEL_CREATE_FAILED",
+                "step0007 Excel already exists. Path = " + pszOutputPath,
+            )
+        except OSError as objException:
+            raise_conversion_error(
+                "STEP0007_EXCEL_CREATE_FAILED",
+                "failed to reserve step0007 Excel. Detail = " + str(objException),
+            )
+        try:
+            iTemporaryFileDescriptor, pszTemporaryPath = tempfile.mkstemp(
+                prefix="group_shipment_summary_step0007_",
+                suffix=".xlsx",
+                dir=os.path.dirname(pszOutputPath),
+            )
+            os.close(iTemporaryFileDescriptor)
+            objWorkbook = Workbook()
+            objWorksheet = objWorkbook.active
+            objWorksheet.title = "グループ別"
+            for iRowIndex, arrFields in enumerate(arrRows, start=1):
+                pszRowType: str = arrFields[1].strip(" \u3000\t")
+                for iColumnIndex, pszValue in enumerate(arrFields, start=1):
+                    objCell = objWorksheet.cell(iRowIndex, iColumnIndex)
+                    if iColumnIndex <= 2:
+                        objCell.value = pszValue if pszValue != "" else None
+                        continue
+                    objCell.value = convert_step0007_excel_numeric_value(pszValue)
+                    if objCell.value is None:
+                        continue
+                    if pszRowType == "年":
+                        objCell.number_format = "0"
+                    elif pszRowType == "月":
+                        objCell.number_format = "00"
+                    elif pszRowType in {"入雛羽数", "出荷羽数"}:
+                        objCell.number_format = "0"
+                    elif pszRowType == "正味重量":
+                        objCell.number_format = "0.##########"
+                    elif pszRowType == "平均体重":
+                        objCell.number_format = "0.000"
+            objWorkbook.save(pszTemporaryPath)
+            objWorkbook.close()
+            objWorkbook = None
+        except ConversionError:
+            raise
+        except Exception as objException:
+            raise_conversion_error(
+                "STEP0007_EXCEL_WRITE_FAILED",
+                "failed to write step0007 Excel. Detail = " + str(objException),
+            )
+        try:
+            os.replace(pszTemporaryPath, pszOutputPath)
+            pszTemporaryPath = ""
+            bOutputReserved = False
+        except Exception as objException:
+            raise_conversion_error(
+                "STEP0007_EXCEL_FINALIZE_FAILED",
+                "failed to finalize step0007 Excel. Detail = " + str(objException),
+            )
+    finally:
+        if objWorkbook is not None:
+            objWorkbook.close()
+        if pszTemporaryPath and os.path.exists(pszTemporaryPath):
+            os.remove(pszTemporaryPath)
+        if bOutputReserved and os.path.exists(pszOutputPath):
+            os.remove(pszOutputPath)
+
+
+def create_step0007_excel_files(
+    arrStep0007TsvPaths: List[str],
+) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0007TsvPath in arrStep0007TsvPaths:
+            arrRows, _ = read_step0007_for_excel(pszStep0007TsvPath)
+            pszOutputPath: str = create_step0007_excel_output_path(
+                pszStep0007TsvPath
+            )
+            write_step0007_excel(pszOutputPath, arrRows)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0007_EXCEL_CLEANUP_FAILED",
+                "step0007 Excel creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0008_output_path(pszStep0007Path: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0007Path)
+    pszFileName: str = os.path.basename(pszStep0007Path)
+    if "_step0007_" not in pszFileName:
+        raise_conversion_error(
+            "INVALID_STEP0007_FOR_STEP0008",
+            "step0007 marker was not found. Path = " + pszStep0007Path,
+        )
+    pszStep0008FileName: str = pszFileName.replace(
+        "_step0007_", "_step0008_", 1
+    )
+    pszStem, pszExtension = os.path.splitext(pszStep0008FileName)
+    pszOutputPath: str = os.path.join(pszDirectory, pszStep0008FileName)
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}{pszExtension}"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def calculate_growth_rate(
+    pszPlacementCount: str, pszShippingCount: str
+) -> Tuple[str, bool]:
+    try:
+        objPlacementCount = Decimal(pszPlacementCount.strip(" \u3000\t"))
+        objShippingCount = Decimal(pszShippingCount.strip(" \u3000\t"))
+    except InvalidOperation:
+        raise_conversion_error(
+            "INVALID_GROWTH_RATE_SOURCE_VALUE",
+            "placement or shipping count was not numeric.",
+        )
+    if not objPlacementCount.is_finite() or not objShippingCount.is_finite():
+        raise_conversion_error(
+            "INVALID_GROWTH_RATE_SOURCE_VALUE",
+            "placement or shipping count was not finite.",
+        )
+    if objPlacementCount < 0 or objShippingCount < 0:
+        raise_conversion_error(
+            "INVALID_GROWTH_RATE_SOURCE_VALUE",
+            "placement and shipping counts must not be negative.",
+        )
+    if objPlacementCount == 0:
+        return "", True
+    objRate: Decimal = objShippingCount / objPlacementCount
+    return (
+        format(
+            objRate.quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP),
+            "7.4f",
+        ),
+        False,
+    )
+
+
+def write_step0008_tsv(
+    pszOutputPath: str, arrRows: List[List[str]]
+) -> None:
+    if not arrRows:
+        raise_conversion_error(
+            "INVALID_STEP0007_FOR_STEP0008",
+            "step0008 did not contain any rows.",
+        )
+    try:
+        write_monthly_tsv(
+            pszOutputPath,
+            "\t".join(arrRows[0]),
+            ["\t".join(arrRow) for arrRow in arrRows[1:]],
+        )
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0008_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0008_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0008_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0008_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0008_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def format_growth_rate_warning(
+    iWarningNumber: int, dicWarning: Dict[str, str]
+) -> str:
+    return (
+        "\r\n[警告 "
+        + str(iWarningNumber)
+        + "]\r\n"
+        + "警告種別: "
+        + dicWarning["type"]
+        + "\r\n入力step0007: "
+        + dicWarning["input"]
+        + "\r\n出力step0008: "
+        + dicWarning["output"]
+        + "\r\n処理年月: "
+        + dicWarning["month"]
+        + "\r\nグループ№: "
+        + dicWarning["group_number"]
+        + "\r\nグループ名: "
+        + dicWarning["group_name"]
+        + "\r\n対象列: 入雛羽数, 出荷羽数\r\n"
+        + "警告理由: 入雛羽数が0のため育成率を計算できません。\r\n"
+        + "出力値: empty\r\n"
+    )
+
+
+def write_growth_rate_warnings(
+    pszInputExcelPath: str,
+    pszExistingWarningPath: str,
+    iExistingWarningCount: int,
+    arrWarnings: List[Dict[str, str]],
+) -> str:
+    if not arrWarnings:
+        return pszExistingWarningPath
+    iTotalWarningCount: int = iExistingWarningCount + len(arrWarnings)
+    if pszExistingWarningPath:
+        pszTemporaryPath: str = ""
+        try:
+            with open(
+                pszExistingWarningPath, "r", encoding="utf-8", newline=""
+            ) as objFile:
+                pszExistingText: str = objFile.read()
+            objCountMatch = re.search(r"警告件数: (\d+)", pszExistingText)
+            if objCountMatch is None:
+                raise_conversion_error(
+                    "WARNING_FILE_UPDATE_FAILED",
+                    "warning count was not found in existing warning file. Path = "
+                    + pszExistingWarningPath,
+                )
+            pszExistingText = (
+                pszExistingText[: objCountMatch.start()]
+                + "警告件数: "
+                + str(iTotalWarningCount)
+                + pszExistingText[objCountMatch.end() :]
+            )
+            for iIndex, dicWarning in enumerate(
+                arrWarnings, start=iExistingWarningCount + 1
+            ):
+                pszExistingText += format_growth_rate_warning(iIndex, dicWarning)
+            iFileDescriptor, pszTemporaryPath = tempfile.mkstemp(
+                prefix="group_shipment_summary_warning_",
+                suffix=".txt",
+                dir=os.path.dirname(pszExistingWarningPath),
+            )
+            os.close(iFileDescriptor)
+            with open(
+                pszTemporaryPath, "w", encoding="utf-8", newline=""
+            ) as objFile:
+                objFile.write(pszExistingText)
+            os.replace(pszTemporaryPath, pszExistingWarningPath)
+            pszTemporaryPath = ""
+            return pszExistingWarningPath
+        except ConversionError:
+            raise
+        except Exception as objException:
+            raise_conversion_error(
+                "WARNING_FILE_UPDATE_FAILED",
+                "failed to update warning file. Detail = " + str(objException),
+            )
+        finally:
+            if pszTemporaryPath and os.path.exists(pszTemporaryPath):
+                os.remove(pszTemporaryPath)
+
+    pszWarningPath: str = create_warning_path(pszInputExcelPath)
+    try:
+        with open(pszWarningPath, "x", encoding="utf-8", newline="") as objFile:
+            objFile.write("育成率追加が警告付きで完了しました。\r\n")
+            objFile.write("入力Excel: " + pszInputExcelPath + "\r\n")
+            objFile.write("警告件数: " + str(len(arrWarnings)) + "\r\n")
+            for iIndex, dicWarning in enumerate(arrWarnings, start=1):
+                objFile.write(format_growth_rate_warning(iIndex, dicWarning))
+        return pszWarningPath
+    except Exception as objException:
+        if os.path.exists(pszWarningPath):
+            os.remove(pszWarningPath)
+        raise_conversion_error(
+            "WARNING_FILE_CREATE_FAILED",
+            "failed to create growth-rate warning file. Detail = "
+            + str(objException),
+        )
+
+
+def create_step0008_files(
+    arrStep0007Paths: List[str],
+    pszInputExcelPath: str,
+    pszExistingWarningPath: str,
+    iExistingWarningCount: int,
+) -> Tuple[List[str], str, int]:
+    arrCreatedPaths: List[str] = []
+    arrWarnings: List[Dict[str, str]] = []
+    try:
+        for pszStep0007Path in arrStep0007Paths:
+            arrInputRows, iYear = read_step0007_for_excel(pszStep0007Path)
+            pszOutputPath: str = create_step0008_output_path(pszStep0007Path)
+            arrOutputRows: List[List[str]] = [
+                list(arrInputRows[0]), list(arrInputRows[1])
+            ]
+            arrMonths: List[str] = arrInputRows[1][2:]
+            for iGroupIndex, (pszGroupNumber, pszGroupName) in enumerate(GROUPS):
+                iGroupStart: int = 2 + iGroupIndex * 4
+                arrGroupRows: List[List[str]] = [
+                    list(arrRow)
+                    for arrRow in arrInputRows[iGroupStart : iGroupStart + 4]
+                ]
+                arrGrowthRateRow: List[str] = ["", "育成率"]
+                for iValueIndex, pszMonth in enumerate(arrMonths, start=2):
+                    pszGrowthRate, bDivisionByZero = calculate_growth_rate(
+                        arrGroupRows[0][iValueIndex],
+                        arrGroupRows[1][iValueIndex],
+                    )
+                    arrGrowthRateRow.append(pszGrowthRate)
+                    if bDivisionByZero:
+                        arrWarnings.append(
+                            {
+                                "type": "GROWTH_RATE_DIVISION_BY_ZERO",
+                                "input": pszStep0007Path,
+                                "output": pszOutputPath,
+                                "month": f"{iYear:04d}{int(pszMonth):02d}",
+                                "group_number": pszGroupNumber,
+                                "group_name": pszGroupName,
+                            }
+                        )
+                arrOutputRows.extend(arrGroupRows)
+                arrOutputRows.append(arrGrowthRateRow)
+            write_step0008_tsv(pszOutputPath, arrOutputRows)
+            arrCreatedPaths.append(pszOutputPath)
+        pszWarningPath: str = write_growth_rate_warnings(
+            pszInputExcelPath,
+            pszExistingWarningPath,
+            iExistingWarningCount,
+            arrWarnings,
+        )
+        return (
+            arrCreatedPaths,
+            pszWarningPath,
+            iExistingWarningCount + len(arrWarnings),
+        )
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0008_CLEANUP_FAILED",
+                "step0008 creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def read_step0008_for_step0009(
+    pszInputPath: str,
+) -> List[List[str]]:
+    objFileNameMatch = re.search(
+        r"_step0008_グループ別_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0008_FILENAME",
+            "unexpected step0008 file name. Path = " + pszInputPath,
+        )
+    iExpectedYear: int = int(objFileNameMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows: List[List[str]] = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0008_READ_FAILED",
+            "failed to read step0008 TSV. Path = "
+            + pszInputPath + ", Detail = " + str(objException),
+        )
+    arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
+    for _, pszGroupName in GROUPS:
+        arrExpectedStructure.extend(
+            [(pszGroupName, "入雛羽数"), ("", "出荷羽数"),
+             ("", "正味重量"), ("", "平均体重"), ("", "育成率")]
+        )
+    if len(arrRows) != len(arrExpectedStructure):
+        raise_conversion_error(
+            "INVALID_STEP0008_ROW_COUNT",
+            "step0008 must contain 17 rows. Path = " + pszInputPath,
+        )
+    iColumnCount: int = len(arrRows[0])
+    if iColumnCount < 3 or any(len(arrRow) != iColumnCount for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0008_COLUMN_COUNT",
+            "step0008 rows must have equal columns and at least one data column. Path = "
+            + pszInputPath,
+        )
+    for iRowIndex, objExpected in enumerate(arrExpectedStructure):
+        if tuple(pszValue.strip(" \u3000\t") for pszValue in arrRows[iRowIndex][:2]) != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0008_ROW_STRUCTURE",
+                "unexpected step0008 row structure. Path = "
+                + pszInputPath + ", Line = " + str(iRowIndex + 1),
+            )
+    arrMonths: List[int] = []
+    for iColumnIndex in range(2, iColumnCount):
+        iYear, iMonth = parse_year_month(
+            arrRows[0][iColumnIndex], arrRows[1][iColumnIndex], iColumnIndex + 1
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0008_YEAR",
+                "step0008 year did not match its file name. Path = " + pszInputPath,
+            )
+        if arrMonths and iMonth <= arrMonths[-1]:
+            raise_conversion_error(
+                "INVALID_STEP0008_MONTH",
+                "step0008 months must be unique and ascending. Path = " + pszInputPath,
+            )
+        arrMonths.append(iMonth)
+        for iRowIndex in range(2, len(arrRows)):
+            pszItemName: str = arrExpectedStructure[iRowIndex][1]
+            try:
+                objValue = parse_decimal_value(
+                    arrRows[iRowIndex][iColumnIndex],
+                    iRowIndex + 1, iColumnIndex, pszItemName,
+                )
+            except ConversionError as objException:
+                raise_conversion_error("INVALID_STEP0008_ITEM_VALUE", str(objException))
+            if objValue is None and pszItemName not in {"平均体重", "育成率"}:
+                raise_conversion_error(
+                    "INVALID_STEP0008_ITEM_VALUE",
+                    "step0008 item value was blank. Path = "
+                    + pszInputPath + ", Line = " + str(iRowIndex + 1),
+                )
+    return arrRows
+
+
+def create_step0008_excel_output_path(pszStep0008TsvPath: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0008TsvPath)
+    pszStem: str = os.path.splitext(os.path.basename(pszStep0008TsvPath))[0]
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".xlsx")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.xlsx"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def write_step0008_excel(
+    pszOutputPath: str, arrRows: List[List[str]]
+) -> None:
+    pszTemporaryPath: str = ""
+    bOutputReserved: bool = False
+    objWorkbook: Optional[Workbook] = None
+    try:
+        try:
+            iFileDescriptor: int = os.open(
+                pszOutputPath, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.close(iFileDescriptor)
+            bOutputReserved = True
+        except FileExistsError:
+            raise_conversion_error(
+                "STEP0008_EXCEL_CREATE_FAILED",
+                "step0008 Excel already exists. Path = " + pszOutputPath,
+            )
+        except OSError as objException:
+            raise_conversion_error(
+                "STEP0008_EXCEL_CREATE_FAILED",
+                "failed to reserve step0008 Excel. Detail = " + str(objException),
+            )
+        try:
+            iTemporaryFileDescriptor, pszTemporaryPath = tempfile.mkstemp(
+                prefix="group_shipment_summary_step0008_",
+                suffix=".xlsx",
+                dir=os.path.dirname(pszOutputPath),
+            )
+            os.close(iTemporaryFileDescriptor)
+            objWorkbook = Workbook()
+            objWorksheet = objWorkbook.active
+            objWorksheet.title = "グループ別"
+            for iRowIndex, arrFields in enumerate(arrRows, start=1):
+                pszRowType: str = arrFields[1].strip(" \u3000\t")
+                for iColumnIndex, pszValue in enumerate(arrFields, start=1):
+                    objCell = objWorksheet.cell(iRowIndex, iColumnIndex)
+                    if iColumnIndex <= 2:
+                        objCell.value = pszValue if pszValue != "" else None
+                        continue
+                    pszNormalizedValue: str = pszValue.strip(" \u3000\t")
+                    if pszNormalizedValue == "":
+                        continue
+                    objValue: Decimal = Decimal(pszNormalizedValue)
+                    objCell.value = (
+                        int(objValue) if objValue == objValue.to_integral_value()
+                        else float(objValue)
+                    )
+                    if pszRowType in {"年", "入雛羽数", "出荷羽数"}:
+                        objCell.number_format = "0"
+                    elif pszRowType == "月":
+                        objCell.number_format = "00"
+                    elif pszRowType == "正味重量":
+                        iDecimalPlaces: int = max(0, -objValue.as_tuple().exponent)
+                        objCell.number_format = (
+                            "0." + "0" * iDecimalPlaces if iDecimalPlaces else "0"
+                        )
+                    elif pszRowType == "平均体重":
+                        objCell.number_format = "0.000"
+                    elif pszRowType == "育成率":
+                        objCell.number_format = "0.0000"
+            objWorkbook.save(pszTemporaryPath)
+            objWorkbook.close()
+            objWorkbook = None
+        except Exception as objException:
+            raise_conversion_error(
+                "STEP0008_EXCEL_WRITE_FAILED",
+                "failed to write step0008 Excel. Detail = " + str(objException),
+            )
+        try:
+            os.replace(pszTemporaryPath, pszOutputPath)
+            pszTemporaryPath = ""
+            bOutputReserved = False
+        except Exception as objException:
+            raise_conversion_error(
+                "STEP0008_EXCEL_FINALIZE_FAILED",
+                "failed to finalize step0008 Excel. Detail = " + str(objException),
+            )
+    finally:
+        if objWorkbook is not None:
+            objWorkbook.close()
+        if pszTemporaryPath and os.path.exists(pszTemporaryPath):
+            os.remove(pszTemporaryPath)
+        if bOutputReserved and os.path.exists(pszOutputPath):
+            os.remove(pszOutputPath)
+
+
+def create_step0008_excel_files(
+    arrStep0008TsvPaths: List[str],
+) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0008TsvPath in arrStep0008TsvPaths:
+            arrRows = read_step0008_for_step0009(pszStep0008TsvPath)
+            pszOutputPath: str = create_step0008_excel_output_path(
+                pszStep0008TsvPath
+            )
+            write_step0008_excel(pszOutputPath, arrRows)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0008_EXCEL_CLEANUP_FAILED",
+                "step0008 Excel creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0009_output_path(pszStep0008Path: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0008Path)
+    pszFileName: str = os.path.basename(pszStep0008Path)
+    if "_step0008_" not in pszFileName:
+        raise_conversion_error(
+            "INVALID_STEP0008_FOR_STEP0009",
+            "step0008 marker was not found. Path = " + pszStep0008Path,
+        )
+    pszFileName = pszFileName.replace("_step0008_", "_step0009_", 1)
+    pszStem, pszExtension = os.path.splitext(pszFileName)
+    pszOutputPath: str = os.path.join(pszDirectory, pszFileName)
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}{pszExtension}"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0009_rows(arrInputRows: List[List[str]]) -> List[List[str]]:
+    arrOutputRows: List[List[str]] = [
+        arrRow[:2] + [
+            format_sum_value(Decimal(pszValue.strip(" \u3000\t")))
+            if pszValue.strip(" \u3000\t") else ""
+            for pszValue in arrRow[2:]
+        ]
+        for arrRow in arrInputRows
+    ]
+    arrTotalRows: List[List[str]] = [
+        ["合計", "入雛羽数"], ["", "出荷羽数"], ["", "正味重量"],
+        ["", "平均体重"], ["", "育成率"],
+    ]
+    for iColumnIndex in range(2, len(arrInputRows[0])):
+        arrTotals: List[Decimal] = [
+            sum(
+                (Decimal(arrInputRows[2 + iGroupIndex * 5 + iItemIndex][iColumnIndex].strip(" \u3000\t"))
+                 for iGroupIndex in range(len(GROUPS))),
+                Decimal("0"),
+            )
+            for iItemIndex in range(3)
+        ]
+        objAverageWeight: Decimal = (
+            (arrTotals[2] / arrTotals[1]).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+            if arrTotals[1] != 0 else Decimal("0")
+        )
+        objGrowthRate: Decimal = (
+            (arrTotals[1] / arrTotals[0]).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            if arrTotals[0] != 0 else Decimal("0")
+        )
+        for arrRow, objValue in zip(arrTotalRows, arrTotals + [objAverageWeight, objGrowthRate]):
+            arrRow.append(format_sum_value(objValue))
+    return arrOutputRows + arrTotalRows
+
+
+def write_step0009_tsv(pszOutputPath: str, arrRows: List[List[str]]) -> None:
+    try:
+        write_monthly_tsv(
+            pszOutputPath, "\t".join(arrRows[0]),
+            ["\t".join(arrRow) for arrRow in arrRows[1:]],
+        )
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0009_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0009_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0009_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0009_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0009_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def create_step0009_files(arrStep0008Paths: List[str]) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0008Path in arrStep0008Paths:
+            arrInputRows = read_step0008_for_step0009(pszStep0008Path)
+            pszOutputPath: str = create_step0009_output_path(pszStep0008Path)
+            write_step0009_tsv(pszOutputPath, create_step0009_rows(arrInputRows))
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0009_CLEANUP_FAILED",
+                "step0009 creation failed. Original error = "
+                + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def read_step0009_for_excel(
+    pszInputPath: str,
+) -> List[List[str]]:
+    objFileNameMatch = re.search(
+        r"_step0009_グループ別_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0009_FILENAME",
+            "unexpected step0009 file name. Path = " + pszInputPath,
+        )
+    iExpectedYear: int = int(objFileNameMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows: List[List[str]] = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0009_READ_FAILED",
+            "failed to read step0009 TSV. Path = "
+            + pszInputPath + ", Detail = " + str(objException),
+        )
+    arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
+    for pszGroupName in [pszName for _, pszName in GROUPS] + ["合計"]:
+        arrExpectedStructure.extend(
+            [(pszGroupName, "入雛羽数"), ("", "出荷羽数"),
+             ("", "正味重量"), ("", "平均体重"), ("", "育成率")]
+        )
+    if len(arrRows) != len(arrExpectedStructure):
+        raise_conversion_error(
+            "INVALID_STEP0009_ROW_COUNT",
+            "step0009 must contain 22 rows. Path = " + pszInputPath,
+        )
+    iColumnCount: int = len(arrRows[0])
+    if iColumnCount < 3 or any(len(arrRow) != iColumnCount for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0009_COLUMN_COUNT",
+            "step0009 rows must have equal columns and at least one data column. Path = "
+            + pszInputPath,
+        )
+    for iRowIndex, objExpected in enumerate(arrExpectedStructure):
+        if tuple(pszValue.strip(" \u3000\t") for pszValue in arrRows[iRowIndex][:2]) != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0009_ROW_STRUCTURE",
+                "unexpected step0009 row structure. Path = "
+                + pszInputPath + ", Line = " + str(iRowIndex + 1),
+            )
+    arrMonths: List[int] = []
+    for iColumnIndex in range(2, iColumnCount):
+        iYear, iMonth = parse_year_month(
+            arrRows[0][iColumnIndex], arrRows[1][iColumnIndex], iColumnIndex + 1
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0009_YEAR",
+                "step0009 year did not match its file name. Path = " + pszInputPath,
+            )
+        if arrMonths and iMonth <= arrMonths[-1]:
+            raise_conversion_error(
+                "INVALID_STEP0009_MONTH",
+                "step0009 months must be unique and ascending. Path = " + pszInputPath,
+            )
+        arrMonths.append(iMonth)
+        for iRowIndex in range(2, len(arrRows)):
+            pszItemName: str = arrExpectedStructure[iRowIndex][1]
+            try:
+                objValue = parse_decimal_value(
+                    arrRows[iRowIndex][iColumnIndex],
+                    iRowIndex + 1, iColumnIndex, pszItemName,
+                )
+            except ConversionError as objException:
+                raise_conversion_error("INVALID_STEP0009_ITEM_VALUE", str(objException))
+            if objValue is None and not (
+                iRowIndex < 17 and pszItemName in {"平均体重", "育成率"}
+            ):
+                raise_conversion_error(
+                    "INVALID_STEP0009_ITEM_VALUE",
+                    "step0009 item value was blank. Path = "
+                    + pszInputPath + ", Line = " + str(iRowIndex + 1),
+                )
+    return arrRows
+
+
+def create_step0009_excel_output_path(pszStep0009TsvPath: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0009TsvPath)
+    pszStem: str = os.path.splitext(os.path.basename(pszStep0009TsvPath))[0]
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".xlsx")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.xlsx"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def write_step0009_excel(
+    pszOutputPath: str, arrRows: List[List[str]]
+) -> None:
+    pszTemporaryPath: str = ""
+    bOutputReserved: bool = False
+    objWorkbook: Optional[Workbook] = None
+    try:
+        try:
+            iFileDescriptor: int = os.open(
+                pszOutputPath, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.close(iFileDescriptor)
+            bOutputReserved = True
+        except FileExistsError:
+            raise_conversion_error(
+                "STEP0009_EXCEL_CREATE_FAILED",
+                "step0009 Excel already exists. Path = " + pszOutputPath,
+            )
+        except OSError as objException:
+            raise_conversion_error(
+                "STEP0009_EXCEL_CREATE_FAILED",
+                "failed to reserve step0009 Excel. Detail = " + str(objException),
+            )
+        try:
+            iTemporaryFileDescriptor, pszTemporaryPath = tempfile.mkstemp(
+                prefix="group_shipment_summary_step0009_",
+                suffix=".xlsx",
+                dir=os.path.dirname(pszOutputPath),
+            )
+            os.close(iTemporaryFileDescriptor)
+            objWorkbook = Workbook()
+            objWorksheet = objWorkbook.active
+            objWorksheet.title = "グループ別"
+            for iRowIndex, arrFields in enumerate(arrRows, start=1):
+                pszRowType: str = arrFields[1].strip(" \u3000\t")
+                for iColumnIndex, pszValue in enumerate(arrFields, start=1):
+                    objCell = objWorksheet.cell(iRowIndex, iColumnIndex)
+                    if iColumnIndex <= 2:
+                        objCell.value = pszValue if pszValue != "" else None
+                        continue
+                    pszNormalizedValue: str = pszValue.strip(" \u3000\t")
+                    if pszNormalizedValue == "":
+                        continue
+                    objValue: Decimal = Decimal(pszNormalizedValue)
+                    objCell.value = (
+                        int(objValue) if objValue == objValue.to_integral_value()
+                        else float(objValue)
+                    )
+                    if pszRowType in {"年", "入雛羽数", "出荷羽数"}:
+                        objCell.number_format = "0"
+                    elif pszRowType == "月":
+                        objCell.number_format = "0"
+                    elif pszRowType == "正味重量":
+                        iDecimalPlaces: int = max(0, -objValue.as_tuple().exponent)
+                        objCell.number_format = (
+                            "0." + "#" * iDecimalPlaces if iDecimalPlaces else "0"
+                        )
+                    elif pszRowType == "平均体重":
+                        objCell.number_format = "0" if objValue == objValue.to_integral_value() else "0.###"
+                    elif pszRowType == "育成率":
+                        objCell.number_format = "0" if objValue == objValue.to_integral_value() else "0.####"
+            objWorkbook.save(pszTemporaryPath)
+            objWorkbook.close()
+            objWorkbook = None
+        except Exception as objException:
+            raise_conversion_error(
+                "STEP0009_EXCEL_WRITE_FAILED",
+                "failed to write step0009 Excel. Detail = " + str(objException),
+            )
+        try:
+            os.replace(pszTemporaryPath, pszOutputPath)
+            pszTemporaryPath = ""
+            bOutputReserved = False
+        except Exception as objException:
+            raise_conversion_error(
+                "STEP0009_EXCEL_FINALIZE_FAILED",
+                "failed to finalize step0009 Excel. Detail = " + str(objException),
+            )
+    finally:
+        if objWorkbook is not None:
+            objWorkbook.close()
+        if pszTemporaryPath and os.path.exists(pszTemporaryPath):
+            os.remove(pszTemporaryPath)
+        if bOutputReserved and os.path.exists(pszOutputPath):
+            os.remove(pszOutputPath)
+
+
+def create_step0009_excel_files(
+    arrStep0009TsvPaths: List[str],
+) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0009TsvPath in arrStep0009TsvPaths:
+            arrRows = read_step0009_for_excel(pszStep0009TsvPath)
+            pszOutputPath: str = create_step0009_excel_output_path(
+                pszStep0009TsvPath
+            )
+            write_step0009_excel(pszOutputPath, arrRows)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0009_EXCEL_CLEANUP_FAILED",
+                "step0009 Excel creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def read_step0009_for_step0010(pszInputPath: str) -> List[List[str]]:
+    arrRows = read_step0009_for_excel(pszInputPath)
+    if len(arrRows[0]) != 14 or [
+        int(Decimal(pszMonth.strip(" \u3000\t"))) for pszMonth in arrRows[1][2:]
+    ] != list(range(1, 13)):
+        raise_conversion_error(
+            "INVALID_STEP0009_FOR_STEP0010",
+            "step0010 requires all 12 months in ascending order. Path = " + pszInputPath,
+        )
+    for iRowIndex, arrRow in enumerate(arrRows[2:], start=3):
+        if arrRow[1].strip(" \u3000\t") in {"入雛羽数", "出荷羽数"}:
+            for pszValue in arrRow[2:]:
+                objValue: Decimal = Decimal(pszValue.strip(" \u3000\t"))
+                if objValue != objValue.to_integral_value():
+                    raise_conversion_error(
+                        "INVALID_STEP0010_COUNT_VALUE",
+                        "placement and shipping counts must be integers. Path = "
+                        + pszInputPath + ", Line = " + str(iRowIndex),
+                    )
+    return arrRows
+
+
+def create_step0010_output_path(pszStep0009Path: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0009Path)
+    pszFileName: str = os.path.basename(pszStep0009Path)
+    if "_step0009_" not in pszFileName:
+        raise_conversion_error(
+            "INVALID_STEP0009_FOR_STEP0010",
+            "step0009 marker was not found. Path = " + pszStep0009Path,
+        )
+    pszFileName = pszFileName.replace("_step0009_", "_step0010_", 1)
+    pszStem, pszExtension = os.path.splitext(pszFileName)
+    pszOutputPath: str = os.path.join(pszDirectory, pszFileName)
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}{pszExtension}"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0010_rows(arrInputRows: List[List[str]]) -> List[List[str]]:
+    arrOutputRows: List[List[str]] = [list(arrRow) for arrRow in arrInputRows]
+    arrOutputRows[0].append("")
+    arrOutputRows[1].append("合計")
+    for iGroupIndex in range(len(GROUPS) + 1):
+        iGroupStart: int = 2 + iGroupIndex * 5
+        arrTotals: List[Decimal] = [
+            sum(
+                (Decimal(pszValue.strip(" \u3000\t"))
+                 for pszValue in arrInputRows[iGroupStart + iItemIndex][2:]),
+                Decimal("0"),
+            )
+            for iItemIndex in range(3)
+        ]
+        objAverageWeight: Decimal = (
+            (arrTotals[2] / arrTotals[1]).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+            if arrTotals[1] != 0 else Decimal("0")
+        )
+        objGrowthRate: Decimal = (
+            (arrTotals[1] / arrTotals[0]).quantize(Decimal("0.0001"), rounding=ROUND_HALF_UP)
+            if arrTotals[0] != 0 else Decimal("0")
+        )
+        for iItemIndex, objValue in enumerate(arrTotals + [objAverageWeight, objGrowthRate]):
+            arrOutputRows[iGroupStart + iItemIndex].append(format_sum_value(objValue))
+    return arrOutputRows
+
+
+def write_step0010_tsv(pszOutputPath: str, arrRows: List[List[str]]) -> None:
+    try:
+        write_monthly_tsv(
+            pszOutputPath, "\t".join(arrRows[0]),
+            ["\t".join(arrRow) for arrRow in arrRows[1:]],
+        )
+    except ConversionError as objException:
+        dicErrorCodes: Dict[str, str] = {
+            "MONTHLY_OUTPUT_ALREADY_EXISTS": "STEP0010_CREATE_FAILED",
+            "MONTHLY_TSV_CREATE_FAILED": "STEP0010_CREATE_FAILED",
+            "MONTHLY_TSV_WRITE_FAILED": "STEP0010_WRITE_FAILED",
+            "MONTHLY_TSV_FINALIZE_FAILED": "STEP0010_FINALIZE_FAILED",
+        }
+        raise_conversion_error(
+            dicErrorCodes.get(objException.pszErrorCode, "STEP0010_WRITE_FAILED"),
+            str(objException),
+        )
+
+
+def create_step0010_files(arrStep0009Paths: List[str]) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0009Path in arrStep0009Paths:
+            arrInputRows = read_step0009_for_step0010(pszStep0009Path)
+            pszOutputPath: str = create_step0010_output_path(pszStep0009Path)
+            write_step0010_tsv(pszOutputPath, create_step0010_rows(arrInputRows))
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0010_CLEANUP_FAILED",
+                "step0010 creation failed. Original error = "
+                + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def read_step0010_for_excel(
+    pszInputPath: str,
+) -> List[List[str]]:
+    objFileNameMatch = re.search(
+        r"_step0010_グループ別_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0010_FILENAME",
+            "unexpected step0010 file name. Path = " + pszInputPath,
+        )
+    iExpectedYear: int = int(objFileNameMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows: List[List[str]] = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0010_READ_FAILED",
+            "failed to read step0010 TSV. Path = "
+            + pszInputPath + ", Detail = " + str(objException),
+        )
+    arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
+    for pszGroupName in [pszName for _, pszName in GROUPS] + ["合計"]:
+        arrExpectedStructure.extend(
+            [(pszGroupName, "入雛羽数"), ("", "出荷羽数"),
+             ("", "正味重量"), ("", "平均体重"), ("", "育成率")]
+        )
+    if len(arrRows) != len(arrExpectedStructure):
+        raise_conversion_error(
+            "INVALID_STEP0010_ROW_COUNT",
+            "step0010 must contain 22 rows. Path = " + pszInputPath,
+        )
+    iColumnCount: int = len(arrRows[0])
+    if iColumnCount != 15 or any(len(arrRow) != iColumnCount for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0010_COLUMN_COUNT",
+            "step0010 rows must contain exactly 15 columns. Path = "
+            + pszInputPath,
+        )
+    for iRowIndex, objExpected in enumerate(arrExpectedStructure):
+        if tuple(pszValue.strip(" \u3000\t") for pszValue in arrRows[iRowIndex][:2]) != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0010_ROW_STRUCTURE",
+                "unexpected step0010 row structure. Path = "
+                + pszInputPath + ", Line = " + str(iRowIndex + 1),
+            )
+    if arrRows[0][14] != "" or arrRows[1][14] != "合計":
+        raise_conversion_error(
+            "INVALID_STEP0010_TOTAL_HEADER",
+            "step0010 annual column must have a blank year and a total label. Path = " + pszInputPath,
+        )
+    arrMonths: List[int] = []
+    for iColumnIndex in range(2, 14):
+        iYear, iMonth = parse_year_month(
+            arrRows[0][iColumnIndex], arrRows[1][iColumnIndex], iColumnIndex + 1
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0010_YEAR",
+                "step0010 year did not match its file name. Path = " + pszInputPath,
+            )
+        if arrMonths and iMonth <= arrMonths[-1]:
+            raise_conversion_error(
+                "INVALID_STEP0010_MONTH",
+                "step0010 months must be unique and ascending. Path = " + pszInputPath,
+            )
+        arrMonths.append(iMonth)
+        for iRowIndex in range(2, len(arrRows)):
+            pszItemName: str = arrExpectedStructure[iRowIndex][1]
+            try:
+                objValue = parse_decimal_value(
+                    arrRows[iRowIndex][iColumnIndex],
+                    iRowIndex + 1, iColumnIndex, pszItemName,
+                )
+            except ConversionError as objException:
+                raise_conversion_error("INVALID_STEP0010_ITEM_VALUE", str(objException))
+            if objValue is None and not (
+                iRowIndex < 17 and pszItemName in {"平均体重", "育成率"}
+            ):
+                raise_conversion_error(
+                    "INVALID_STEP0010_ITEM_VALUE",
+                    "step0010 item value was blank. Path = "
+                    + pszInputPath + ", Line = " + str(iRowIndex + 1),
+                )
+    if arrMonths != list(range(1, 13)):
+        raise_conversion_error(
+            "INVALID_STEP0010_MONTH",
+            "step0010 must contain months 1 through 12. Path = " + pszInputPath,
+        )
+    for iRowIndex in range(2, len(arrRows)):
+        pszItemName = arrExpectedStructure[iRowIndex][1]
+        try:
+            objAnnualValue = parse_decimal_value(
+                arrRows[iRowIndex][14], iRowIndex + 1, 14, pszItemName
+            )
+        except ConversionError as objException:
+            raise_conversion_error("INVALID_STEP0010_ITEM_VALUE", str(objException))
+        if objAnnualValue is None:
+            raise_conversion_error(
+                "INVALID_STEP0010_ITEM_VALUE",
+                "step0010 annual value was blank. Path = "
+                + pszInputPath + ", Line = " + str(iRowIndex + 1),
+            )
+        if pszItemName in {"入雛羽数", "出荷羽数"}:
+            for iColumnIndex in range(2, 15):
+                objCount: Decimal = Decimal(arrRows[iRowIndex][iColumnIndex].strip(" \u3000\t"))
+                if objCount != objCount.to_integral_value():
+                    raise_conversion_error(
+                        "INVALID_STEP0010_COUNT_VALUE",
+                        "step0010 counts must be integers. Path = "
+                        + pszInputPath + ", Line = " + str(iRowIndex + 1),
+                    )
+    return arrRows
+
+
+def create_step0010_excel_output_path(pszStep0010TsvPath: str) -> str:
+    pszDirectory: str = os.path.dirname(pszStep0010TsvPath)
+    pszStem: str = os.path.splitext(os.path.basename(pszStep0010TsvPath))[0]
+    pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".xlsx")
+    iSuffix: int = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.xlsx"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def write_step0010_excel(
+    pszOutputPath: str, arrRows: List[List[str]]
+) -> None:
+    pszTemporaryPath: str = ""
+    bOutputReserved: bool = False
+    objWorkbook: Optional[Workbook] = None
+    try:
+        try:
+            iFileDescriptor: int = os.open(
+                pszOutputPath, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+            )
+            os.close(iFileDescriptor)
+            bOutputReserved = True
+        except FileExistsError:
+            raise_conversion_error(
+                "STEP0010_EXCEL_CREATE_FAILED",
+                "step0010 Excel already exists. Path = " + pszOutputPath,
+            )
+        except OSError as objException:
+            raise_conversion_error(
+                "STEP0010_EXCEL_CREATE_FAILED",
+                "failed to reserve step0010 Excel. Detail = " + str(objException),
+            )
+        try:
+            iTemporaryFileDescriptor, pszTemporaryPath = tempfile.mkstemp(
+                prefix="group_shipment_summary_step0010_",
+                suffix=".xlsx",
+                dir=os.path.dirname(pszOutputPath),
+            )
+            os.close(iTemporaryFileDescriptor)
+            objWorkbook = Workbook()
+            objWorksheet = objWorkbook.active
+            objWorksheet.title = "グループ別"
+            for iRowIndex, arrFields in enumerate(arrRows, start=1):
+                pszRowType: str = arrFields[1].strip(" \u3000\t")
+                for iColumnIndex, pszValue in enumerate(arrFields, start=1):
+                    objCell = objWorksheet.cell(iRowIndex, iColumnIndex)
+                    if iColumnIndex <= 2:
+                        objCell.value = pszValue if pszValue != "" else None
+                        continue
+                    if iRowIndex == 2 and iColumnIndex == 15:
+                        objCell.value = pszValue
+                        continue
+                    pszNormalizedValue: str = pszValue.strip(" \u3000\t")
+                    if pszNormalizedValue == "":
+                        continue
+                    objValue: Decimal = Decimal(pszNormalizedValue)
+                    objCell.value = (
+                        int(objValue) if objValue == objValue.to_integral_value()
+                        else float(objValue)
+                    )
+                    if pszRowType in {"年", "入雛羽数", "出荷羽数"}:
+                        objCell.number_format = "0"
+                    elif pszRowType == "月":
+                        objCell.number_format = "0"
+                    elif pszRowType == "正味重量":
+                        iDecimalPlaces: int = max(0, -objValue.as_tuple().exponent)
+                        objCell.number_format = (
+                            "0." + "#" * iDecimalPlaces if iDecimalPlaces else "0"
+                        )
+                    elif pszRowType == "平均体重":
+                        iDecimalPlaces = max(3, -objValue.as_tuple().exponent) if iColumnIndex < 15 else 3
+                        objCell.number_format = (
+                            "0" if objValue == objValue.to_integral_value()
+                            else "0." + "#" * iDecimalPlaces
+                        )
+                    elif pszRowType == "育成率":
+                        iDecimalPlaces = max(4, -objValue.as_tuple().exponent) if iColumnIndex < 15 else 4
+                        objCell.number_format = (
+                            "0" if objValue == objValue.to_integral_value()
+                            else "0." + "#" * iDecimalPlaces
+                        )
+            objWorkbook.save(pszTemporaryPath)
+            objWorkbook.close()
+            objWorkbook = None
+        except Exception as objException:
+            raise_conversion_error(
+                "STEP0010_EXCEL_WRITE_FAILED",
+                "failed to write step0010 Excel. Detail = " + str(objException),
+            )
+        try:
+            os.replace(pszTemporaryPath, pszOutputPath)
+            pszTemporaryPath = ""
+            bOutputReserved = False
+        except Exception as objException:
+            raise_conversion_error(
+                "STEP0010_EXCEL_FINALIZE_FAILED",
+                "failed to finalize step0010 Excel. Detail = " + str(objException),
+            )
+    finally:
+        if objWorkbook is not None:
+            objWorkbook.close()
+        if pszTemporaryPath and os.path.exists(pszTemporaryPath):
+            os.remove(pszTemporaryPath)
+        if bOutputReserved and os.path.exists(pszOutputPath):
+            os.remove(pszOutputPath)
+
+
+def create_step0010_excel_files(
+    arrStep0010TsvPaths: List[str],
+) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0010TsvPath in arrStep0010TsvPaths:
+            arrRows = read_step0010_for_excel(pszStep0010TsvPath)
+            pszOutputPath: str = create_step0010_excel_output_path(
+                pszStep0010TsvPath
+            )
+            write_step0010_excel(pszOutputPath, arrRows)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0010_EXCEL_CLEANUP_FAILED",
+                "step0010 Excel creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def convert_excel_to_tsv(pszOutputTsvPath: str, pszInputExcelPath: str) -> Tuple[int, int]:
+    try:
+        objFormulaWorkbook = load_workbook(
+            pszInputExcelPath, data_only=False, read_only=False
+        )
+        objValueWorkbook = load_workbook(
+            pszInputExcelPath, data_only=True, read_only=False
+        )
+    except Exception as objException:
+        pszDetail: str = str(objException)
+        pszCode: str = (
+            "EXCEL_PASSWORD_PROTECTED"
+            if "password" in pszDetail.lower() or "encrypted" in pszDetail.lower()
+            else "EXCEL_OPEN_FAILED"
+        )
+        raise_conversion_error(pszCode, "failed to open Excel workbook. Detail = " + pszDetail)
+
+    pszTemporaryTsvPath: str = ""
+    bOutputReserved: bool = False
+    try:
+        if TARGET_SHEET_NAME not in objFormulaWorkbook.sheetnames:
+            raise_conversion_error(
+                "DETAIL_SHEET_NOT_FOUND",
+                "worksheet was not found. Sheet = " + TARGET_SHEET_NAME,
+            )
+
+        objFormulaWorksheet = objFormulaWorkbook[TARGET_SHEET_NAME]
+        objValueWorksheet = objValueWorkbook[TARGET_SHEET_NAME]
+        objBounds = find_data_bounds(objFormulaWorksheet, objValueWorksheet)
+        if objBounds is None:
+            raise_conversion_error(
+                "EMPTY_DETAIL_SHEET",
+                "no data was found in worksheet. Sheet = " + TARGET_SHEET_NAME,
+            )
+        iLastRow, iLastColumn = objBounds
+
+        reserve_output_path(pszOutputTsvPath)
+        bOutputReserved = True
+        try:
+            iTemporaryFileDescriptor, pszTemporaryTsvPath = tempfile.mkstemp(
+                prefix="group_shipment_summary_",
+                suffix=".tsv",
+                dir=os.path.dirname(pszOutputTsvPath),
+            )
+            os.close(iTemporaryFileDescriptor)
+        except OSError as objException:
+            raise_conversion_error(
+                "TSV_TEMP_CREATE_FAILED",
+                "failed to create temporary TSV. Detail = " + str(objException),
+            )
+
+        try:
+            with open(pszTemporaryTsvPath, "w", encoding="utf-8", newline="") as objTsvFile:
+                for iRow in range(1, iLastRow + 1):
+                    arrValues = []
+                    for iColumn in range(1, iLastColumn + 1):
+                        objFormulaCell = objFormulaWorksheet.cell(iRow, iColumn)
+                        objValueCell = objValueWorksheet.cell(iRow, iColumn)
+                        if objFormulaCell.data_type == "f" and objValueCell.value is None:
+                            raise_conversion_error(
+                                "FORMULA_RESULT_UNAVAILABLE",
+                                "saved formula result was not available. Cell = "
+                                + objFormulaCell.coordinate,
+                            )
+                        arrValues.append(format_cell_value(objFormulaCell, objValueCell.value))
+                    objTsvFile.write("\t".join(arrValues) + "\r\n")
+            os.replace(pszTemporaryTsvPath, pszOutputTsvPath)
+            pszTemporaryTsvPath = ""
+            bOutputReserved = False
+        except ConversionError:
+            raise
+        except Exception as objException:
+            raise_conversion_error(
+                "TSV_WRITE_FAILED", "failed to write TSV. Detail = " + str(objException)
+            )
+
+        print("対象シート: " + TARGET_SHEET_NAME)
+        print(
+            "出力範囲: A1:"
+            + get_column_letter(iLastColumn)
+            + str(iLastRow)
+        )
+        print("出力行数: " + str(iLastRow))
+        print("出力列数: " + str(iLastColumn))
+        return iLastRow, iLastColumn
+    finally:
+        objFormulaWorkbook.close()
+        objValueWorkbook.close()
+        if pszTemporaryTsvPath and os.path.exists(pszTemporaryTsvPath):
+            os.remove(pszTemporaryTsvPath)
+        if bOutputReserved and os.path.exists(pszOutputTsvPath):
+            os.remove(pszOutputTsvPath)
+
+
+def main() -> int:
+    if len(sys.argv) != 3:
+        print(
+            "Usage: python group_shipment_summary_Cmd.py "
+            "<output_tsv_path> <input_excel_path>",
+            file=sys.stderr,
+        )
+        return 1
+
+    pszOutputTsvPath: str = os.path.abspath(sys.argv[1])
+    pszInputExcelPath: str = os.path.abspath(sys.argv[2])
+
+    try:
+        validate_paths(pszOutputTsvPath, pszInputExcelPath)
+        convert_excel_to_tsv(pszOutputTsvPath, pszInputExcelPath)
+        (
+            arrMonthlyTsvPaths,
+            objFirstYearMonth,
+            objLastYearMonth,
+        ) = split_tsv_by_month(pszOutputTsvPath)
+        (
+            arrAggregatedTsvPaths,
+            pszWarningPath,
+            iWarningCount,
+        ) = aggregate_step0001_files(arrMonthlyTsvPaths, pszInputExcelPath)
+        (
+            arrTotalTsvPaths,
+            pszWarningPath,
+            iWarningCount,
+        ) = create_step0002_total_files(
+            arrMonthlyTsvPaths, pszInputExcelPath, pszWarningPath, iWarningCount
+        )
+        arrStep0003Paths, arrStep0003YearMonths = create_step0003_files(
+            arrAggregatedTsvPaths, objLastYearMonth[0]
+        )
+        arrStep0003TotalPaths, arrStep0003TotalYearMonths = create_step0003_total_files(
+            arrTotalTsvPaths, objLastYearMonth[0]
+        )
+        (
+            arrStep0004PlacementAveragePaths,
+            arrStep0004PlacementAverageYearMonths,
+        ) = create_step0004_total_placement_average_files(arrStep0003TotalPaths)
+        (
+            arrStep0004ShipmentCountWeightPaths,
+            arrStep0004ShipmentCountWeightYearMonths,
+        ) = create_step0004_total_shipment_count_weight_files(arrStep0003TotalPaths)
+        (
+            arrStep0004TotalWeightPaths,
+            arrStep0004TotalWeightYearMonths,
+        ) = create_step0004_total_weight_files(arrStep0003TotalPaths)
+        (
+            arrStep0004TotalCountPaths,
+            arrStep0004TotalCountYearMonths,
+        ) = create_step0004_total_count_files(arrStep0003TotalPaths)
+        (
+            arrStep0004TotalPreSlaughterCountPaths,
+            arrStep0004TotalPreSlaughterCountYearMonths,
+        ) = create_step0004_total_pre_slaughter_count_files(arrStep0003TotalPaths)
+        (
+            arrStep0004TotalPreSlaughterWeightPaths,
+            arrStep0004TotalPreSlaughterWeightYearMonths,
+        ) = create_step0004_total_pre_slaughter_weight_files(arrStep0003TotalPaths)
+        (
+            arrStep0005PreSlaughterCountPaths,
+            arrStep0005PreSlaughterWeightPaths,
+            arrStep0005PreSlaughterYearMonths,
+        ) = create_step0005_pre_slaughter_subtotal_files(
+            arrStep0004TotalPreSlaughterCountPaths, arrStep0004TotalPreSlaughterWeightPaths
+        )
+        (
+            arrStep0005DiscardCountPaths,
+            arrStep0005DiscardWeightPaths,
+            arrStep0005DiscardYearMonths,
+        ) = create_step0005_discard_subtotal_files(
+            arrStep0004TotalCountPaths, arrStep0004TotalWeightPaths
+        )
+        (
+            arrStep0006DiscardSummaryLowerPaths,
+            arrStep0006DiscardSummaryLowerYearMonths,
+        ) = create_step0006_discard_summary_lower_files(
+            arrStep0004ShipmentCountWeightPaths,
+            arrStep0005PreSlaughterWeightPaths,
+            arrStep0005DiscardWeightPaths,
+        )
+        (
+            arrStep0006DiscardSummaryUpperPaths,
+            arrStep0006DiscardSummaryUpperYearMonths,
+        ) = create_step0006_discard_summary_upper_files(
+            arrStep0004PlacementAveragePaths,
+            arrStep0005PreSlaughterCountPaths,
+            arrStep0005DiscardCountPaths,
+        )
+        (
+            arrStep0007DiscardSummaryUpperPaths,
+            arrStep0007DiscardSummaryUpperYearMonths,
+        ) = create_step0007_discard_summary_upper_files(
+            arrStep0006DiscardSummaryUpperPaths
+        )
+        (
+            arrStep0007DiscardSummaryLowerPaths,
+            arrStep0007DiscardSummaryLowerYearMonths,
+        ) = create_step0007_discard_summary_lower_files(
+            arrStep0006DiscardSummaryLowerPaths
+        )
+        (
+            arrStep0008DiscardSummaryPaths,
+            arrStep0008DiscardSummaryYearMonths,
+        ) = create_step0008_discard_summary_files(
+            arrStep0007DiscardSummaryUpperPaths,
+            arrStep0007DiscardSummaryLowerPaths,
+        )
+        (
+            arrStep0009DiscardSummaryPaths,
+            arrStep0009DiscardSummaryYearMonths,
+        ) = create_step0009_discard_summary_files(arrStep0008DiscardSummaryPaths)
+        arrStep0010DiscardSummaryPaths = create_step0010_discard_summary_files(
+            arrStep0009DiscardSummaryPaths
+        )
+        arrStep0004Paths, arrStep0004YearMonths = create_step0004_files(
+            pszOutputTsvPath, arrStep0003Paths, arrStep0003YearMonths
+        )
+        arrStep0005Paths, arrStep0005Years = create_step0005_files(
+            pszOutputTsvPath, arrStep0004Paths, arrStep0004YearMonths
+        )
+        arrStep0006Paths = create_step0006_files(arrStep0005Paths)
+        arrStep0007Paths, arrStep0007Years = create_step0007_files(
+            pszOutputTsvPath, arrStep0006Paths
+        )
+        arrStep0007ExcelPaths = create_step0007_excel_files(arrStep0007Paths)
+        (
+            arrStep0008Paths,
+            pszWarningPath,
+            iWarningCount,
+        ) = create_step0008_files(
+            arrStep0007Paths,
+            pszInputExcelPath,
+            pszWarningPath,
+            iWarningCount,
+        )
+        arrStep0008ExcelPaths = create_step0008_excel_files(arrStep0008Paths)
+        arrStep0009Paths = create_step0009_files(arrStep0008Paths)
+        arrStep0009ExcelPaths = create_step0009_excel_files(arrStep0009Paths)
+        arrStep0010Paths = create_step0010_files(arrStep0009Paths)
+        arrStep0010ExcelPaths = create_step0010_excel_files(arrStep0010Paths)
+    except Exception as objException:
+        pszErrorCode: str = getattr(
+            objException, "pszErrorCode", "UNEXPECTED_CONVERSION_ERROR"
+        )
+        pszErrorDetail: str = str(objException)
+        print(
+            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, add annual totals, or add yearly total columns. Detail = "
+            + pszErrorDetail,
+            file=sys.stderr,
+        )
+        try:
+            pszErrorPath: str = write_error_file(
+                pszInputExcelPath, pszErrorCode, pszErrorDetail
+            )
+            print("Error file: " + pszErrorPath, file=sys.stderr)
+        except Exception as objErrorFileException:
+            print(
+                "Error: failed to create error file. Detail = "
+                + str(objErrorFileException),
+                file=sys.stderr,
+            )
+        return 1
+
+    print("元TSV: " + pszOutputTsvPath)
+    print("step0001ファイル数: " + str(len(arrMonthlyTsvPaths)))
+    print("step0002グループ別ファイル数: " + str(len(arrAggregatedTsvPaths)))
+    print("step0002総計ファイル数: " + str(len(arrTotalTsvPaths)))
+    print("集計グループ数: 3")
+    print("最初の年月: " + f"{objFirstYearMonth[0]:04d}_{objFirstYearMonth[1]:02d}")
+    print("最後の年月: " + f"{objLastYearMonth[0]:04d}_{objLastYearMonth[1]:02d}")
+    print("step0003最新年: " + str(objLastYearMonth[0]))
+    print("step0003前年: " + str(objLastYearMonth[0] - 1))
+    print(
+        "step0003対象年: "
+        + ", ".join(
+            str(iYear) for iYear in range(objLastYearMonth[0] - 4, objLastYearMonth[0] + 1)
+        )
+    )
+    print("step0003項目数: " + str(len(STEP0003_ITEMS)))
+    print("step0003ファイル数: " + str(len(arrStep0003Paths)))
+    print("step0003総計ファイル数: " + str(len(arrStep0003TotalPaths)))
+    print("step0004総計入雛羽数・平均体重ファイル数: " + str(len(arrStep0004PlacementAveragePaths)))
+    print("step0004総計出荷羽数・出荷重量ファイル数: " + str(len(arrStep0004ShipmentCountWeightPaths)))
+    print("step0004総計重量ファイル数: " + str(len(arrStep0004TotalWeightPaths)))
+    print("step0004総計羽数ファイル数: " + str(len(arrStep0004TotalCountPaths)))
+    print(
+        "step0004総計懸鳥前羽数ファイル数: "
+        + str(len(arrStep0004TotalPreSlaughterCountPaths))
+    )
+    print(
+        "step0004総計懸鳥前重量ファイル数: "
+        + str(len(arrStep0004TotalPreSlaughterWeightPaths))
+    )
+    print("step0005総計懸鳥前羽数ファイル数: " + str(len(arrStep0005PreSlaughterCountPaths)))
+    print("step0005総計懸鳥前重量ファイル数: " + str(len(arrStep0005PreSlaughterWeightPaths)))
+    print("step0005総計廃棄羽数ファイル数: " + str(len(arrStep0005DiscardCountPaths)))
+    print("step0005総計廃棄重量ファイル数: " + str(len(arrStep0005DiscardWeightPaths)))
+    print("step0006総計廃棄データ一覧表上段ファイル数: " + str(len(arrStep0006DiscardSummaryUpperPaths)))
+    print("step0006総計廃棄データ一覧表下段ファイル数: " + str(len(arrStep0006DiscardSummaryLowerPaths)))
+    print("step0007総計廃棄データ一覧表上段ファイル数: " + str(len(arrStep0007DiscardSummaryUpperPaths)))
+    print("step0007総計廃棄データ一覧表下段ファイル数: " + str(len(arrStep0007DiscardSummaryLowerPaths)))
+    print("step0008総計廃棄データ一覧表ファイル数: " + str(len(arrStep0008DiscardSummaryPaths)))
+    print("step0009総計廃棄データ一覧表ファイル数: " + str(len(arrStep0009DiscardSummaryPaths)))
+    print("step0010総計廃棄データ一覧表ファイル数: " + str(len(arrStep0010DiscardSummaryPaths)))
+    if arrStep0003YearMonths:
+        print(
+            "step0003最初の年月: "
+            + f"{arrStep0003YearMonths[0][0]:04d}_{arrStep0003YearMonths[0][1]:02d}"
+        )
+        print(
+            "step0003最後の年月: "
+            + f"{arrStep0003YearMonths[-1][0]:04d}_{arrStep0003YearMonths[-1][1]:02d}"
+        )
+    print("step0004対象項目: 入雛羽数, 出荷羽数, 正味重量, 平均体重")
+    print("step0004グループ数: " + str(len(GROUPS)))
+    print("step0004ファイル数: " + str(len(arrStep0004Paths)))
+    if arrStep0004YearMonths:
+        print(
+            "step0004最初の年月: "
+            + f"{arrStep0004YearMonths[0][0]:04d}_{arrStep0004YearMonths[0][1]:02d}"
+        )
+        print(
+            "step0004最後の年月: "
+            + f"{arrStep0004YearMonths[-1][0]:04d}_{arrStep0004YearMonths[-1][1]:02d}"
+        )
+    print("step0005対象年数: " + str(len(arrStep0005Years)))
+    print("step0005グループ数: " + str(len(GROUPS)))
+    print("step0005ファイル数: " + str(len(arrStep0005Paths)))
+    if arrStep0005Years:
+        print("step0005最初の年: " + str(arrStep0005Years[0]))
+        print("step0005最後の年: " + str(arrStep0005Years[-1]))
+    print("step0006入力ファイル数: " + str(len(arrStep0005Paths)))
+    print("step0006ファイル数: " + str(len(arrStep0006Paths)))
+    print("step0007対象年数: " + str(len(arrStep0007Years)))
+    print("step0007ファイル数: " + str(len(arrStep0007Paths)))
+    if arrStep0007Years:
+        print("step0007最初の年: " + str(arrStep0007Years[0]))
+        print("step0007最後の年: " + str(arrStep0007Years[-1]))
+    print("step0007 Excel入力ファイル数: " + str(len(arrStep0007Paths)))
+    print("step0007 Excelファイル数: " + str(len(arrStep0007ExcelPaths)))
+    print("step0008入力ファイル数: " + str(len(arrStep0007Paths)))
+    print("step0008ファイル数: " + str(len(arrStep0008Paths)))
+    print("step0008 Excel入力ファイル数: " + str(len(arrStep0008Paths)))
+    print("step0008 Excelファイル数: " + str(len(arrStep0008ExcelPaths)))
+    print("step0009入力ファイル数: " + str(len(arrStep0008Paths)))
+    print("step0009ファイル数: " + str(len(arrStep0009Paths)))
+    print("step0009 Excel入力ファイル数: " + str(len(arrStep0009Paths)))
+    print("step0009 Excelファイル数: " + str(len(arrStep0009ExcelPaths)))
+    print("step0010入力ファイル数: " + str(len(arrStep0009Paths)))
+    print("step0010ファイル数: " + str(len(arrStep0010Paths)))
+    print("step0010 Excel入力ファイル数: " + str(len(arrStep0010Paths)))
+    print("step0010 Excelファイル数: " + str(len(arrStep0010ExcelPaths)))
+    print("警告件数: " + str(iWarningCount))
+    if pszWarningPath:
+        print("警告ファイル: " + pszWarningPath)
+    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・年間Excel作成・育成率追加・step0008年間Excel作成・年間合計追加・step0009年間Excel作成・年間合計列追加・step0010年間Excel作成完了 ◇")
+    print("入力Excel: " + pszInputExcelPath)
+    print("出力フォルダ: " + os.path.dirname(pszOutputTsvPath))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
