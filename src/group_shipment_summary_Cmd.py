@@ -2155,7 +2155,7 @@ def create_step0004_total_pre_slaughter_count_files(
 
 
 STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS: List[str] = [
-    "懸鳥前死鶏重量",
+    "懸鳥前死鶏重量", "懸鳥前発育不良重量",
 ]
 
 
@@ -2181,7 +2181,7 @@ def create_step0004_total_pre_slaughter_weight_output_path(
 def create_step0004_total_pre_slaughter_weight_files(
     arrStep0003TotalPaths: List[str],
 ) -> Tuple[List[str], List[Tuple[int, int]]]:
-    """各年月の懸鳥前総計重量を指定順に横結合し、数値表記を保持します。"""
+    """各年月の懸鳥前総計重量2項目を指定順に横結合し、数値表記を保持します。"""
     dicInputs: Dict[Tuple[str, str, int, int, str], Dict[str, str]] = {}
     for pszInputPath in arrStep0003TotalPaths:
         pszBaseName, pszItemName, iYear, iMonth, pszSuffix = (
@@ -2298,7 +2298,7 @@ def read_step0004_pre_slaughter_subtotal_input(
     arrExpectedHeader = (
         ["年", "月", "ｸﾞﾙｰﾌﾟ№", "ｸﾞﾙｰﾌﾟ名"]
         + (["懸鳥前死鶏" + pszKind, "懸鳥前発育不良" + pszKind]
-           if pszKind == "羽数" else ["懸鳥前死鶏重量"])
+           if pszKind == "羽数" else STEP0004_TOTAL_PRE_SLAUGHTER_WEIGHT_ITEMS)
     )
     if len(arrHeader) != len(arrExpectedHeader) or len(arrFields) != len(arrExpectedHeader):
         raise_conversion_error(
