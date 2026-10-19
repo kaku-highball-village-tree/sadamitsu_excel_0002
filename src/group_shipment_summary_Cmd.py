@@ -603,7 +603,9 @@ def split_tsv_by_month(
     return arrCreatedPaths, arrYearMonths[0], arrYearMonths[-1]
 
 
-def create_step0002_output_path(pszStep0001Path: str) -> str:
+def create_step0002_output_path(
+    pszStep0001Path: str, bVariety: bool = True
+) -> str:
     pszDirectory: str = os.path.dirname(pszStep0001Path)
     pszFileName: str = os.path.basename(pszStep0001Path)
     if "_step0001_" not in pszFileName:
@@ -611,7 +613,10 @@ def create_step0002_output_path(pszStep0001Path: str) -> str:
             "INVALID_STEP0001_FILE_NAME",
             "step0001 marker was not found. Path = " + pszStep0001Path,
         )
-    pszStem: str = os.path.splitext(pszFileName.replace("_step0001_", "_step0002_品種別_", 1))[0]
+    pszCategory: str = "品種別" if bVariety else "グループ別"
+    pszStem: str = os.path.splitext(
+        pszFileName.replace("_step0001_", f"_step0002_{pszCategory}_", 1)
+    )[0]
     pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
     iSuffix: int = 2
     while os.path.exists(pszOutputPath):
@@ -736,7 +741,10 @@ def write_step0002_tsv(
 
 
 def aggregate_step0001(
-    pszInputPath: str, pszOutputPath: str, arrWarnings: List[Dict[str, str]]
+    pszInputPath: str,
+    pszOutputPath: str,
+    arrWarnings: List[Dict[str, str]],
+    bVariety: bool = True,
 ) -> None:
     try:
         with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
@@ -754,8 +762,12 @@ def aggregate_step0001(
             "step0001 header must contain 64 columns. Actual = " + str(len(arrHeader)),
         )
 
+    arrCategories = VARIETIES if bVariety else GROUPS
+    iNumberColumnIndex, iNameColumnIndex = (15, 16) if bVariety else (10, 11)
+    pszCategoryCode = "VARIETY" if bVariety else "GROUP"
+    pszCategoryName = "variety" if bVariety else "group"
     dicRows: Dict[str, List[Tuple[int, List[str]]]] = {
-        pszVarietyName: [] for _, pszVarietyName in VARIETIES
+        pszVarietyName: [] for _, pszVarietyName in arrCategories
     }
     objYearMonth: Optional[Tuple[int, int]] = None
     for iLineNumber, pszLine in enumerate(arrLines[1:], start=2):
@@ -782,23 +794,23 @@ def aggregate_step0001(
                 "YEAR_MONTH_MISMATCH", "multiple year/month values in step0001 TSV."
             )
 
-        pszVarietyNumber: str = arrFields[15].strip(" \u3000\t")
-        pszVarietyName: str = arrFields[16].strip(" \u3000\t")
+        pszVarietyNumber: str = arrFields[iNumberColumnIndex].strip(" \u3000\t")
+        pszVarietyName: str = arrFields[iNameColumnIndex].strip(" \u3000\t")
         dicExpectedVarieties: Dict[str, str] = {
-            pszName: pszNumber for pszNumber, pszName in VARIETIES
+            pszName: pszNumber for pszNumber, pszName in arrCategories
         }
         if pszVarietyName not in dicExpectedVarieties:
             raise_conversion_error(
-                "INVALID_VARIETY_NAME",
-                "unsupported variety name. Line = "
+                "INVALID_" + pszCategoryCode + "_NAME",
+                "unsupported " + pszCategoryName + " name. Line = "
                 + str(iLineNumber)
                 + ", Value = "
                 + pszVarietyName,
             )
         if pszVarietyNumber != dicExpectedVarieties[pszVarietyName]:
             raise_conversion_error(
-                "INVALID_VARIETY_MAPPING",
-                "variety number and name do not match. Line = " + str(iLineNumber),
+                "INVALID_" + pszCategoryCode + "_MAPPING",
+                pszCategoryName + " number and name do not match. Line = " + str(iLineNumber),
             )
         for iColumnIndex in NUMERIC_COLUMN_INDEXES:
             parse_decimal_value(
@@ -811,7 +823,7 @@ def aggregate_step0001(
     iYear, iMonth = objYearMonth
     pszProcessMonth: str = f"{iYear:04d}{iMonth:02d}"
     arrOutputRows: List[str] = []
-    for pszVarietyNumber, pszVarietyName in VARIETIES:
+    for pszVarietyNumber, pszVarietyName in arrCategories:
         arrGroupRows = dicRows[pszVarietyName]
         arrOutput: List[str] = ["－"] * 64
         arrOutput[0] = f"{iYear:04d}"
@@ -819,8 +831,8 @@ def aggregate_step0001(
         arrOutput[10] = "－"
         arrOutput[11] = "－"
         arrOutput[14] = pszProcessMonth
-        arrOutput[15] = pszVarietyNumber
-        arrOutput[16] = pszVarietyName
+        arrOutput[iNumberColumnIndex] = pszVarietyNumber
+        arrOutput[iNameColumnIndex] = pszVarietyName
 
         if not arrGroupRows:
             arrOutput[3] = ""
@@ -829,14 +841,14 @@ def aggregate_step0001(
                 arrOutput[iColumnIndex] = "0"
             add_warning(
                 arrWarnings,
-                "MISSING_VARIETY_DATA",
+                "MISSING_" + pszCategoryCode + "_DATA",
                 pszInputPath,
                 pszOutputPath,
                 pszProcessMonth,
                 pszVarietyNumber,
                 pszVarietyName,
                 "4(D), 5(E), 6(F), 18(R)-64(BL)",
-                "variety contains no input rows.",
+                pszCategoryName + " contains no input rows.",
                 "average columns are empty; sum columns are 0",
             )
         else:
@@ -939,7 +951,7 @@ def write_warning_file(
     pszWarningPath: str = create_warning_path(pszInputExcelPath)
     try:
         with open(pszWarningPath, "x", encoding="utf-8", newline="") as objFile:
-            objFile.write("月次・品種別・総計集計が警告付きで完了しました。\r\n")
+            objFile.write("月次・グループ別・品種別・総計集計が警告付きで完了しました。\r\n")
             objFile.write("入力Excel: " + pszInputExcelPath + "\r\n")
             objFile.write("警告件数: " + str(len(arrWarnings)) + "\r\n")
             for iIndex, dicWarning in enumerate(arrWarnings, start=1):
@@ -950,6 +962,9 @@ def write_warning_file(
                 objFile.write("処理年月: " + dicWarning["month"] + "\r\n")
                 if dicWarning["group_name"] == "総計":
                     objFile.write("集計対象: 総計\r\n")
+                elif dicWarning["group_name"] in {pszName for _, pszName in GROUPS}:
+                    objFile.write("グループ№: " + dicWarning["group_number"] + "\r\n")
+                    objFile.write("グループ名: " + dicWarning["group_name"] + "\r\n")
                 else:
                     objFile.write("品種No.: " + dicWarning["group_number"] + "\r\n")
                     objFile.write("品種名: " + dicWarning["group_name"] + "\r\n")
@@ -967,19 +982,28 @@ def write_warning_file(
 
 
 def aggregate_step0001_files(
-    arrStep0001Paths: List[str], pszInputExcelPath: str
+    arrStep0001Paths: List[str],
+    pszInputExcelPath: str,
+    bVariety: bool = True,
+    pszExistingWarningPath: str = "",
+    iExistingWarningCount: int = 0,
 ) -> Tuple[List[str], str, int]:
     arrStep0002Paths: List[str] = []
     arrWarnings: List[Dict[str, str]] = []
     try:
         for pszStep0001Path in arrStep0001Paths:
-            pszStep0002Path: str = create_step0002_output_path(pszStep0001Path)
-            aggregate_step0001(pszStep0001Path, pszStep0002Path, arrWarnings)
+            pszStep0002Path: str = create_step0002_output_path(pszStep0001Path, bVariety)
+            aggregate_step0001(pszStep0001Path, pszStep0002Path, arrWarnings, bVariety)
             arrStep0002Paths.append(pszStep0002Path)
-        pszWarningPath: str = ""
-        if arrWarnings:
-            pszWarningPath = write_warning_file(pszInputExcelPath, arrWarnings)
-        return arrStep0002Paths, pszWarningPath, len(arrWarnings)
+        pszWarningPath: str = pszExistingWarningPath
+        if not pszExistingWarningPath:
+            if arrWarnings:
+                pszWarningPath = write_warning_file(pszInputExcelPath, arrWarnings)
+        else:
+            pszWarningPath = write_step0002_total_warnings(
+                pszInputExcelPath, pszExistingWarningPath, iExistingWarningCount, arrWarnings
+            )
+        return arrStep0002Paths, pszWarningPath, iExistingWarningCount + len(arrWarnings)
     except Exception as objException:
         arrCleanupErrors: List[str] = []
         for pszPath in arrStep0002Paths:
@@ -10487,10 +10511,17 @@ def main() -> int:
             objLastYearMonth,
         ) = split_tsv_by_month(pszOutputTsvPath)
         (
-            arrAggregatedTsvPaths,
+            arrVarietyTsvPaths,
             pszWarningPath,
             iWarningCount,
         ) = aggregate_step0001_files(arrMonthlyTsvPaths, pszInputExcelPath)
+        (
+            arrAggregatedTsvPaths,
+            pszWarningPath,
+            iWarningCount,
+        ) = aggregate_step0001_files(
+            arrMonthlyTsvPaths, pszInputExcelPath, False, pszWarningPath, iWarningCount
+        )
         (
             arrTotalTsvPaths,
             pszWarningPath,
@@ -10498,20 +10529,6 @@ def main() -> int:
         ) = create_step0002_total_files(
             arrMonthlyTsvPaths, pszInputExcelPath, pszWarningPath, iWarningCount
         )
-        print("元TSV: " + pszOutputTsvPath)
-        print("step0001ファイル数: " + str(len(arrMonthlyTsvPaths)))
-        print("step0002品種別ファイル数: " + str(len(arrAggregatedTsvPaths)))
-        for pszPath in arrAggregatedTsvPaths:
-            print("step0002品種別ファイル: " + pszPath)
-        print("step0002総計ファイル数: " + str(len(arrTotalTsvPaths)))
-        for pszPath in arrTotalTsvPaths:
-            print("step0002総計ファイル: " + pszPath)
-        print("品種集計順: 阿波尾鶏、赤どり、地養鳥、ブロイラー")
-        print("step0003以降は実行していません。")
-        if pszWarningPath:
-            print("警告ファイル: " + pszWarningPath)
-        return 0
-
         arrStep0003Paths, arrStep0003YearMonths = create_step0003_files(
             arrAggregatedTsvPaths, objLastYearMonth[0]
         )
@@ -10731,8 +10748,14 @@ def main() -> int:
 
     print("元TSV: " + pszOutputTsvPath)
     print("step0001ファイル数: " + str(len(arrMonthlyTsvPaths)))
+    print("step0002品種別ファイル数: " + str(len(arrVarietyTsvPaths)))
+    for pszPath in arrVarietyTsvPaths:
+        print("step0002品種別ファイル: " + pszPath)
+    print("品種集計順: 阿波尾鶏、赤どり、地養鳥、ブロイラー")
     print("step0002グループ別ファイル数: " + str(len(arrAggregatedTsvPaths)))
     print("step0002総計ファイル数: " + str(len(arrTotalTsvPaths)))
+    for pszPath in arrTotalTsvPaths:
+        print("step0002総計ファイル: " + pszPath)
     print("集計グループ数: 3")
     print("最初の年月: " + f"{objFirstYearMonth[0]:04d}_{objFirstYearMonth[1]:02d}")
     print("最後の年月: " + f"{objLastYearMonth[0]:04d}_{objLastYearMonth[1]:02d}")
