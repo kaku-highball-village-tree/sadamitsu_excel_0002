@@ -1290,10 +1290,13 @@ def create_step0002_total_files(
         raise
 
 
-def parse_step0002_file_name(pszStep0002Path: str) -> Tuple[str, int, int, str]:
+def parse_step0002_file_name(
+    pszStep0002Path: str, bVariety: bool = False
+) -> Tuple[str, int, int, str]:
     pszFileName: str = os.path.basename(pszStep0002Path)
+    pszCategory = "品種別" if bVariety else "グループ別"
     objMatch = re.fullmatch(
-        r"(.+)_step0002_グループ別_(\d{4})_(\d{2})(_\d+)?\.tsv", pszFileName
+        rf"(.+)_step0002_{pszCategory}_(\d{{4}})_(\d{{2}})(_\d+)?\.tsv", pszFileName
     )
     if objMatch is None:
         raise_conversion_error(
@@ -1310,13 +1313,16 @@ def parse_step0002_file_name(pszStep0002Path: str) -> Tuple[str, int, int, str]:
     return objMatch.group(1), iYear, iMonth, objMatch.group(4) or ""
 
 
-def create_step0003_output_path(pszStep0002Path: str, pszItemName: str) -> str:
+def create_step0003_output_path(
+    pszStep0002Path: str, pszItemName: str, bVariety: bool = False
+) -> str:
     pszBaseName, iYear, iMonth, pszExistingSuffix = parse_step0002_file_name(
-        pszStep0002Path
+        pszStep0002Path, bVariety
     )
     pszDirectory: str = os.path.dirname(pszStep0002Path)
+    pszCategory = "品種別" if bVariety else "グループ別"
     pszStem: str = (
-        f"{pszBaseName}_step0003_グループ別_{pszItemName}_{iYear:04d}_{iMonth:02d}"
+        f"{pszBaseName}_step0003_{pszCategory}_{pszItemName}_{iYear:04d}_{iMonth:02d}"
         + pszExistingSuffix
     )
     pszOutputPath: str = os.path.join(pszDirectory, pszStem + ".tsv")
@@ -1352,8 +1358,11 @@ def extract_step0003_item_tsv(
     iSourceColumnIndex: int,
     pszSourceHeader: str,
     bAllowBlank: bool,
+    bVariety: bool = False,
 ) -> Tuple[int, int]:
-    _, iFileYear, iFileMonth, _ = parse_step0002_file_name(pszInputPath)
+    _, iFileYear, iFileMonth, _ = parse_step0002_file_name(pszInputPath, bVariety)
+    arrCategories = VARIETIES if bVariety else GROUPS
+    iNumberColumnIndex, iNameColumnIndex = (15, 16) if bVariety else (10, 11)
     try:
         with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
             arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
@@ -1372,10 +1381,10 @@ def extract_step0003_item_tsv(
     dicRequiredHeaders: Dict[int, str] = {
         0: "年",
         1: "月",
-        10: "ｸﾞﾙｰﾌﾟ№",
-        11: "ｸﾞﾙｰﾌﾟ名",
         iSourceColumnIndex: pszSourceHeader,
     }
+    if not bVariety:
+        dicRequiredHeaders.update({10: "ｸﾞﾙｰﾌﾟ№", 11: "ｸﾞﾙｰﾌﾟ名"})
     for iColumnIndex, pszExpectedHeader in dicRequiredHeaders.items():
         if arrHeader[iColumnIndex].strip(" \u3000\t") != pszExpectedHeader:
             raise_conversion_error(
@@ -1387,15 +1396,16 @@ def extract_step0003_item_tsv(
                 + ", Actual = "
                 + arrHeader[iColumnIndex],
             )
-    if len(arrLines) != 4:
+    if len(arrLines) != len(arrCategories) + 1:
         raise_conversion_error(
             "INVALID_STEP0002_ROW_COUNT",
-            "step0002 must contain one header and three data rows. Actual rows = "
+            "step0002 must contain one header and "
+            + ("four" if bVariety else "three") + " data rows. Actual rows = "
             + str(len(arrLines)),
         )
 
     arrOutputRows: List[str] = []
-    for iGroupIndex, (pszExpectedNumber, pszExpectedName) in enumerate(GROUPS, start=1):
+    for iGroupIndex, (pszExpectedNumber, pszExpectedName) in enumerate(arrCategories, start=1):
         iLineNumber: int = iGroupIndex + 1
         arrFields: List[str] = arrLines[iGroupIndex].split("\t")
         if len(arrFields) != 64:
@@ -1413,12 +1423,13 @@ def extract_step0003_item_tsv(
                 "step0002 file name and row year/month do not match. Line = "
                 + str(iLineNumber),
             )
-        pszGroupNumber: str = arrFields[10].strip(" \u3000\t")
-        pszGroupName: str = arrFields[11].strip(" \u3000\t")
+        pszGroupNumber: str = arrFields[iNumberColumnIndex].strip(" \u3000\t")
+        pszGroupName: str = arrFields[iNameColumnIndex].strip(" \u3000\t")
         if (pszGroupNumber, pszGroupName) != (pszExpectedNumber, pszExpectedName):
             raise_conversion_error(
-                "INVALID_STEP0002_GROUP_ORDER",
-                "unexpected group order or mapping. Line = " + str(iLineNumber),
+                "INVALID_STEP0002_VARIETY_ORDER" if bVariety else "INVALID_STEP0002_GROUP_ORDER",
+                "unexpected " + ("variety" if bVariety else "group")
+                + " order or mapping. Line = " + str(iLineNumber),
             )
         try:
             objItemValue = parse_decimal_value(
@@ -1448,8 +1459,8 @@ def extract_step0003_item_tsv(
                 [
                     arrFields[0],
                     arrFields[1],
-                    arrFields[10],
-                    arrFields[11],
+                    arrFields[iNumberColumnIndex],
+                    arrFields[iNameColumnIndex],
                     arrFields[iSourceColumnIndex],
                 ]
             )
@@ -1457,8 +1468,8 @@ def extract_step0003_item_tsv(
     arrOutputHeader: List[str] = [
         arrHeader[0],
         arrHeader[1],
-        arrHeader[10],
-        arrHeader[11],
+        "品種No." if bVariety else arrHeader[10],
+        "品種名" if bVariety else arrHeader[11],
         pszItemName,
     ]
     write_step0003_tsv(pszOutputPath, "\t".join(arrOutputHeader), arrOutputRows)
@@ -1466,12 +1477,12 @@ def extract_step0003_item_tsv(
 
 
 def create_step0003_files(
-    arrStep0002Paths: List[str], iLatestYear: int
+    arrStep0002Paths: List[str], iLatestYear: int, bVariety: bool = False
 ) -> Tuple[List[str], List[Tuple[int, int]]]:
     setTargetYears = set(range(iLatestYear - 4, iLatestYear + 1))
     arrTargets: List[Tuple[int, int, str]] = []
     for pszStep0002Path in arrStep0002Paths:
-        _, iYear, iMonth, _ = parse_step0002_file_name(pszStep0002Path)
+        _, iYear, iMonth, _ = parse_step0002_file_name(pszStep0002Path, bVariety)
         if iYear in setTargetYears:
             arrTargets.append((iYear, iMonth, pszStep0002Path))
     arrTargets.sort()
@@ -1487,7 +1498,7 @@ def create_step0003_files(
                 bAllowBlank,
             ) in STEP0003_ITEMS:
                 pszStep0003Path: str = create_step0003_output_path(
-                    pszStep0002Path, pszItemName
+                    pszStep0002Path, pszItemName, bVariety
                 )
                 try:
                     iYear, iMonth = extract_step0003_item_tsv(
@@ -1497,6 +1508,7 @@ def create_step0003_files(
                         iSourceColumnIndex,
                         pszSourceHeader,
                         bAllowBlank,
+                        bVariety,
                     )
                 except ConversionError as objException:
                     raise_conversion_error(
@@ -1533,6 +1545,127 @@ def create_step0003_files(
                 + str(objException)
                 + "; cleanup errors = "
                 + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0007_variety_output_path(
+    pszStep0003Path: str, pszItemName: str
+) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0003_品種別_(.+)_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszStep0003Path),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0003_VARIETY_FILE_NAME",
+            "invalid variety step0003 file name. Path = " + pszStep0003Path,
+        )
+    iYear, iMonth = parse_year_month(objMatch.group(3), objMatch.group(4), 1)
+    pszStem = (
+        f"{objMatch.group(1)}_step0007_品種別_{pszItemName}_"
+        f"{iYear:04d}_{iMonth:02d}{objMatch.group(5)}"
+    )
+    pszDirectory = os.path.dirname(pszStep0003Path)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0007_variety_files(
+    arrStep0003VarietyPaths: List[str],
+    arrStep0003YearMonths: List[Tuple[int, int]],
+) -> List[str]:
+    """品種別step0003から廃棄合計と廃棄控除後の3項目を追加出力します。"""
+    dicPaths = build_step0003_path_map(
+        arrStep0003VarietyPaths, arrStep0003YearMonths
+    )
+    arrRequiredItems = [
+        "出荷羽数", "出荷重量",
+        *STEP0004_TOTAL_COUNT_ITEMS, *STEP0004_TOTAL_WEIGHT_ITEMS,
+    ]
+    arrOutputItems = [
+        "全廃棄羽数", "全廃棄重量", "処理羽数", "処理重量", "平均体重",
+    ]
+    arrCreatedPaths: List[str] = []
+    try:
+        for iYear, iMonth in arrStep0003YearMonths:
+            dicItemRows = {
+                pszItemName: read_step0003_for_step0004(
+                    dicPaths[(iYear, iMonth, pszItemName)],
+                    pszItemName, False, iYear, iMonth, True,
+                )
+                for pszItemName in arrRequiredItems
+            }
+            dicOutputRows: Dict[str, List[str]] = {
+                pszItemName: [] for pszItemName in arrOutputItems
+            }
+            for objVarietyKey in VARIETIES:
+                arrCommonFields = dicItemRows["出荷羽数"][objVarietyKey][:4]
+                for pszItemName in arrRequiredItems:
+                    if dicItemRows[pszItemName][objVarietyKey][:4] != arrCommonFields:
+                        raise_conversion_error(
+                            "STEP0003_VARIETY_KEY_MISMATCH",
+                            "variety step0003 row keys do not match. Item = "
+                            + pszItemName + "; Variety = " + str(objVarietyKey),
+                        )
+                objDiscardCount = sum(
+                    (Decimal(dicItemRows[pszItemName][objVarietyKey][4])
+                     for pszItemName in STEP0004_TOTAL_COUNT_ITEMS), Decimal("0")
+                )
+                # Match the existing group pipeline: round the combined weight once.
+                objDiscardWeight = sum(
+                    (Decimal(dicItemRows[pszItemName][objVarietyKey][4])
+                     for pszItemName in STEP0004_TOTAL_WEIGHT_ITEMS), Decimal("0")
+                ).quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
+                objProcessedCount = (
+                    Decimal(dicItemRows["出荷羽数"][objVarietyKey][4]) - objDiscardCount
+                )
+                objProcessedWeight = (
+                    Decimal(dicItemRows["出荷重量"][objVarietyKey][4]) - objDiscardWeight
+                )
+                objAverageWeight = (
+                    (objProcessedWeight / objProcessedCount).quantize(
+                        Decimal("0.00000001"), rounding=ROUND_HALF_UP
+                    ) if objProcessedCount != 0 else Decimal("0")
+                )
+                arrValues = [
+                    format(Decimal(format_sum_value(objDiscardCount)), ",f"),
+                    format(objDiscardWeight, ",.1f"),
+                    format_sum_value(objProcessedCount),
+                    format_sum_value(objProcessedWeight),
+                    format_sum_value(objAverageWeight),
+                ]
+                for pszItemName, pszValue in zip(arrOutputItems, arrValues):
+                    dicOutputRows[pszItemName].append(
+                        "\t".join(arrCommonFields + [pszValue])
+                    )
+            for pszItemName in arrOutputItems:
+                pszOutputPath = create_step0007_variety_output_path(
+                    dicPaths[(iYear, iMonth, "出荷羽数")], pszItemName
+                )
+                write_monthly_tsv(
+                    pszOutputPath,
+                    "\t".join(["年", "月", "品種No.", "品種名", pszItemName]),
+                    dicOutputRows[pszItemName],
+                )
+                arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0007_VARIETY_CLEANUP_FAILED",
+                "variety step0007 creation failed. Original error = "
+                + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
             )
         raise
 
@@ -7767,7 +7900,9 @@ def read_step0003_for_step0004(
     bAllowBlank: bool,
     iExpectedYear: int,
     iExpectedMonth: int,
+    bVariety: bool = False,
 ) -> Dict[Tuple[str, str], List[str]]:
+    arrCategories = VARIETIES if bVariety else GROUPS
     try:
         with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
             arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
@@ -7779,10 +7914,11 @@ def read_step0003_for_step0004(
             + ", Detail = "
             + str(objException),
         )
-    if len(arrLines) != 4:
+    if len(arrLines) != len(arrCategories) + 1:
         raise_conversion_error(
             "INVALID_STEP0003_ROW_COUNT",
-            "step0003 must contain one header and three data rows. Path = "
+            "step0003 must contain one header and "
+            + ("four" if bVariety else "three") + " data rows. Path = "
             + pszInputPath
             + ", Actual rows = "
             + str(len(arrLines)),
@@ -7791,8 +7927,8 @@ def read_step0003_for_step0004(
     arrExpectedHeader: List[str] = [
         "年",
         "月",
-        "ｸﾞﾙｰﾌﾟ№",
-        "ｸﾞﾙｰﾌﾟ名",
+        "品種No." if bVariety else "ｸﾞﾙｰﾌﾟ№",
+        "品種名" if bVariety else "ｸﾞﾙｰﾌﾟ名",
         pszExpectedItemName,
     ]
     if len(arrHeader) != 5 or [
@@ -7809,7 +7945,7 @@ def read_step0003_for_step0004(
         )
 
     dicExpectedGroups: Dict[str, str] = {
-        pszNumber: pszName for pszNumber, pszName in GROUPS
+        pszNumber: pszName for pszNumber, pszName in arrCategories
     }
     dicRows: Dict[Tuple[str, str], List[str]] = {}
     for iLineNumber, pszLine in enumerate(arrLines[1:], start=2):
@@ -7837,8 +7973,9 @@ def read_step0003_for_step0004(
         pszGroupName: str = arrFields[3].strip(" \u3000\t")
         if dicExpectedGroups.get(pszGroupNumber) != pszGroupName:
             raise_conversion_error(
-                "INVALID_STEP0003_GROUP",
-                "unexpected step0003 group mapping. Path = "
+                "INVALID_STEP0003_VARIETY" if bVariety else "INVALID_STEP0003_GROUP",
+                "unexpected step0003 " + ("variety" if bVariety else "group")
+                + " mapping. Path = "
                 + pszInputPath
                 + ", Line = "
                 + str(iLineNumber),
@@ -7846,8 +7983,8 @@ def read_step0003_for_step0004(
         objGroupKey: Tuple[str, str] = (pszGroupNumber, pszGroupName)
         if objGroupKey in dicRows:
             raise_conversion_error(
-                "INVALID_STEP0003_GROUP",
-                "duplicate step0003 group. Path = "
+                "INVALID_STEP0003_VARIETY" if bVariety else "INVALID_STEP0003_GROUP",
+                "duplicate step0003 " + ("variety" if bVariety else "group") + ". Path = "
                 + pszInputPath
                 + ", Group = "
                 + str(objGroupKey),
@@ -7881,8 +8018,9 @@ def read_step0003_for_step0004(
     setExpectedGroups = set(dicExpectedGroups.items())
     if set(dicRows) != setExpectedGroups:
         raise_conversion_error(
-            "INVALID_STEP0003_GROUP",
-            "step0003 groups were missing or unexpected. Path = " + pszInputPath,
+            "INVALID_STEP0003_VARIETY" if bVariety else "INVALID_STEP0003_GROUP",
+            "step0003 " + ("varieties" if bVariety else "groups")
+            + " were missing or unexpected. Path = " + pszInputPath,
         )
     return dicRows
 
@@ -10529,6 +10667,12 @@ def main() -> int:
         ) = create_step0002_total_files(
             arrMonthlyTsvPaths, pszInputExcelPath, pszWarningPath, iWarningCount
         )
+        arrStep0003VarietyPaths, arrStep0003VarietyYearMonths = create_step0003_files(
+            arrVarietyTsvPaths, objLastYearMonth[0], True
+        )
+        arrStep0007VarietyPaths = create_step0007_variety_files(
+            arrStep0003VarietyPaths, arrStep0003VarietyYearMonths
+        )
         arrStep0003Paths, arrStep0003YearMonths = create_step0003_files(
             arrAggregatedTsvPaths, objLastYearMonth[0]
         )
@@ -10756,6 +10900,8 @@ def main() -> int:
     print("step0002総計ファイル数: " + str(len(arrTotalTsvPaths)))
     for pszPath in arrTotalTsvPaths:
         print("step0002総計ファイル: " + pszPath)
+    print("step0003品種別ファイル数: " + str(len(arrStep0003VarietyPaths)))
+    print("step0007品種別ファイル数: " + str(len(arrStep0007VarietyPaths)))
     print("集計グループ数: 3")
     print("最初の年月: " + f"{objFirstYearMonth[0]:04d}_{objFirstYearMonth[1]:02d}")
     print("最後の年月: " + f"{objLastYearMonth[0]:04d}_{objLastYearMonth[1]:02d}")
