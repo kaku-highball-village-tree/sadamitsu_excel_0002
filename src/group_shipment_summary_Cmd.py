@@ -1562,8 +1562,11 @@ def create_step0007_variety_output_path(
             "invalid variety step0003 file name. Path = " + pszStep0003Path,
         )
     iYear, iMonth = parse_year_month(objMatch.group(3), objMatch.group(4), 1)
+    pszFileItemName = (
+        "控除後平均体重" if pszItemName == "平均体重" else pszItemName
+    )
     pszStem = (
-        f"{objMatch.group(1)}_step0007_品種別_{pszItemName}_"
+        f"{objMatch.group(1)}_step0003_品種別_{pszFileItemName}_"
         f"{iYear:04d}_{iMonth:02d}{objMatch.group(5)}"
     )
     pszDirectory = os.path.dirname(pszStep0003Path)
@@ -10901,7 +10904,7 @@ def main() -> int:
     for pszPath in arrTotalTsvPaths:
         print("step0002総計ファイル: " + pszPath)
     print("step0003品種別ファイル数: " + str(len(arrStep0003VarietyPaths)))
-    print("step0007品種別ファイル数: " + str(len(arrStep0007VarietyPaths)))
+    print("step0003品種別控除後計算ファイル数: " + str(len(arrStep0007VarietyPaths)))
     print("集計グループ数: 3")
     print("最初の年月: " + f"{objFirstYearMonth[0]:04d}_{objFirstYearMonth[1]:02d}")
     print("最後の年月: " + f"{objLastYearMonth[0]:04d}_{objLastYearMonth[1]:02d}")
