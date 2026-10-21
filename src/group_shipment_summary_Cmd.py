@@ -103,6 +103,18 @@ STEP0004_VARIETY_HEADER = (
     "年\t月\t品種No.\t品種名\t入雛羽数\t出荷羽数\t正味重量\t平均体重"
     "\t飼育日数平均\t廃棄控除前育成率"
 )
+STEP0004_VARIETY_DEDUCTION_ITEMS: List[Tuple[str, str, bool]] = [
+    ("入雛羽数", "入雛羽数", False),
+    ("処理羽数", "処理羽数", False),
+    ("処理重量", "処理重量", False),
+    ("控除後平均体重", "平均体重", False),
+    ("飼育日数平均", "日令", True),
+    ("廃棄控除後育成率", "育成率", False),
+]
+STEP0004_VARIETY_DEDUCTION_HEADER = (
+    "年\t月\t品種No.\t品種名\t入雛羽数\t処理羽数\t処理重量"
+    "\t控除後平均体重\t飼育日数平均\t廃棄控除後育成率"
+)
 
 
 STEP0010_GROUP_DEDUCTION_ITEMS: List[Tuple[str, bool]] = [
@@ -8686,6 +8698,195 @@ def create_step0004_variety_files(
         raise
 
 
+def create_step0004_variety_deduction_output_path(
+    pszSourceTsvPath: str,
+    pszVarietyName: str,
+    iYear: int,
+    iMonth: int,
+) -> str:
+    pszDirectory = os.path.dirname(pszSourceTsvPath)
+    pszBaseName = os.path.splitext(os.path.basename(pszSourceTsvPath))[0]
+    pszStem = (
+        f"{pszBaseName}_step0004_品種別_控除廃棄_{pszVarietyName}_"
+        f"{iYear:04d}_{iMonth:02d}"
+    )
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0004_variety_deduction_files(
+    pszSourceTsvPath: str,
+    arrStep0003VarietyPaths: List[str],
+    arrStep0003YearMonths: List[Tuple[int, int]],
+    arrStep0007VarietyPaths: List[str],
+    arrStep0003VarietyHusbandryAveragePaths: List[str],
+    arrStep0003VarietyDeductionGrowthRatePaths: List[str],
+) -> Tuple[List[str], List[Tuple[int, int]]]:
+    """廃棄控除後の品種別step0003項目をstep0004にまとめます。"""
+    dicStep0003Paths = build_step0003_path_map(
+        arrStep0003VarietyPaths, arrStep0003YearMonths
+    )
+
+    def build_item_path_map(
+        arrPaths: List[str],
+        pszFileItemName: str,
+        pszErrorCode: str,
+        bIgnoreOtherItems: bool = False,
+    ) -> Dict[Tuple[int, int], str]:
+        dicPaths: Dict[Tuple[int, int], str] = {}
+        pszPattern = (
+            r".+_step0003_品種別_" + re.escape(pszFileItemName)
+            + r"_(\d{4})_(\d{2})(?:_\d+)*\.tsv"
+        )
+        for pszPath in arrPaths:
+            objMatch = re.fullmatch(pszPattern, os.path.basename(pszPath))
+            if objMatch is None:
+                if bIgnoreOtherItems:
+                    continue
+                raise_conversion_error(
+                    pszErrorCode,
+                    "invalid variety step0003 file name. Path = " + pszPath,
+                )
+            iYear, iMonth = parse_year_month(
+                objMatch.group(1), objMatch.group(2), 1
+            )
+            objKey = (iYear, iMonth)
+            if objKey in dicPaths:
+                raise_conversion_error(
+                    pszErrorCode,
+                    "duplicate variety step0003 item. Year/month = "
+                    + f"{iYear:04d}_{iMonth:02d}"
+                    + ", Item = " + pszFileItemName,
+                )
+            dicPaths[objKey] = pszPath
+        if set(dicPaths) != set(arrStep0003YearMonths):
+            raise_conversion_error(
+                pszErrorCode,
+                "variety step0003 inputs did not match expected year/months. "
+                "Item = " + pszFileItemName,
+            )
+        return dicPaths
+
+    dicProcessedCountPaths = build_item_path_map(
+        arrStep0007VarietyPaths,
+        "処理羽数",
+        "STEP0004_VARIETY_PROCESSED_COUNT_INPUT_MISMATCH",
+        True,
+    )
+    dicProcessedWeightPaths = build_item_path_map(
+        arrStep0007VarietyPaths,
+        "処理重量",
+        "STEP0004_VARIETY_PROCESSED_WEIGHT_INPUT_MISMATCH",
+        True,
+    )
+    dicPostDiscardAverageWeightPaths = build_item_path_map(
+        arrStep0007VarietyPaths,
+        "控除後平均体重",
+        "STEP0004_VARIETY_POST_DISCARD_AVERAGE_WEIGHT_INPUT_MISMATCH",
+        True,
+    )
+    dicHusbandryAveragePaths = build_item_path_map(
+        arrStep0003VarietyHusbandryAveragePaths,
+        "飼育日数平均",
+        "STEP0004_VARIETY_HUSBANDRY_AVERAGE_INPUT_MISMATCH",
+    )
+    dicPostDiscardGrowthRatePaths = build_item_path_map(
+        arrStep0003VarietyDeductionGrowthRatePaths,
+        "廃棄控除後育成率",
+        "STEP0004_VARIETY_POST_DISCARD_GROWTH_RATE_INPUT_MISMATCH",
+    )
+    dicFileItemPaths = {
+        "入雛羽数": {
+            (iYear, iMonth): dicStep0003Paths[(iYear, iMonth, "入雛羽数")]
+            for iYear, iMonth in arrStep0003YearMonths
+        },
+        "処理羽数": dicProcessedCountPaths,
+        "処理重量": dicProcessedWeightPaths,
+        "控除後平均体重": dicPostDiscardAverageWeightPaths,
+        "飼育日数平均": dicHusbandryAveragePaths,
+        "廃棄控除後育成率": dicPostDiscardGrowthRatePaths,
+    }
+    dicInputHeaders = {
+        "入雛羽数": "入雛羽数",
+        "処理羽数": "処理羽数",
+        "処理重量": "処理重量",
+        "控除後平均体重": "平均体重",
+        "飼育日数平均": "日令",
+        "廃棄控除後育成率": "育成率",
+    }
+    arrCreatedPaths: List[str] = []
+    try:
+        for iYear, iMonth in arrStep0003YearMonths:
+            dicItemRows: Dict[str, Dict[Tuple[str, str], List[str]]] = {}
+            for pszOutputItemName, _, bAllowBlank in STEP0004_VARIETY_DEDUCTION_ITEMS:
+                pszInputPath = dicFileItemPaths[pszOutputItemName][(iYear, iMonth)]
+                dicItemRows[pszOutputItemName] = read_step0003_for_step0004(
+                    pszInputPath,
+                    dicInputHeaders[pszOutputItemName],
+                    bAllowBlank,
+                    iYear,
+                    iMonth,
+                    True,
+                )
+
+            for pszVarietyNumber, pszVarietyName in VARIETIES:
+                objVarietyKey = (pszVarietyNumber, pszVarietyName)
+                arrCommonFields = dicItemRows[
+                    STEP0004_VARIETY_DEDUCTION_ITEMS[0][0]
+                ][objVarietyKey][:4]
+                for pszOutputItemName, _, _ in STEP0004_VARIETY_DEDUCTION_ITEMS[1:]:
+                    if (
+                        dicItemRows[pszOutputItemName][objVarietyKey][:4]
+                        != arrCommonFields
+                    ):
+                        raise_conversion_error(
+                            "STEP0003_VARIETY_DEDUCTION_KEY_MISMATCH",
+                            "step0003 deduction variety keys did not match. "
+                            "Year/month = " + f"{iYear:04d}_{iMonth:02d}"
+                            + ", Variety = " + str(objVarietyKey)
+                            + ", Item = " + pszOutputItemName,
+                        )
+                arrOutputFields = arrCommonFields + [
+                    dicItemRows[pszOutputItemName][objVarietyKey][4]
+                    for pszOutputItemName, _, _ in STEP0004_VARIETY_DEDUCTION_ITEMS
+                ]
+                pszOutputPath = create_step0004_variety_deduction_output_path(
+                    pszSourceTsvPath,
+                    pszVarietyName,
+                    iYear,
+                    iMonth,
+                )
+                write_step0004_tsv(
+                    pszOutputPath,
+                    STEP0004_VARIETY_DEDUCTION_HEADER,
+                    "\t".join(arrOutputFields),
+                )
+                arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths, list(arrStep0003YearMonths)
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0004_VARIETY_DEDUCTION_CLEANUP_FAILED",
+                "variety deduction step0004 creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 def create_step0005_output_path(
     pszSourceTsvPath: str, pszGroupName: str, iYear: int
 ) -> str:
@@ -11528,6 +11729,17 @@ def main() -> int:
             arrStep0004VarietyPaths,
             arrStep0004VarietyYearMonths,
         )
+        (
+            arrStep0004VarietyDeductionPaths,
+            arrStep0004VarietyDeductionYearMonths,
+        ) = create_step0004_variety_deduction_files(
+            pszOutputTsvPath,
+            arrStep0003VarietyPaths,
+            arrStep0003VarietyYearMonths,
+            arrStep0007VarietyPaths,
+            arrStep0003VarietyHusbandryAveragePaths,
+            arrStep0003VarietyDeductionGrowthRatePaths,
+        )
         arrStep0003Paths, arrStep0003YearMonths = create_step0003_files(
             arrAggregatedTsvPaths, objLastYearMonth[0]
         )
@@ -11757,6 +11969,10 @@ def main() -> int:
         print("step0002総計ファイル: " + pszPath)
     print("step0003品種別ファイル数: " + str(len(arrStep0003VarietyPaths)))
     print("step0004品種別ファイル数: " + str(len(arrStep0004VarietyPaths)))
+    print(
+        "step0004品種別控除廃棄ファイル数: "
+        + str(len(arrStep0004VarietyDeductionPaths))
+    )
     print("step0005品種別年間ファイル数: " + str(len(arrStep0005VarietyPaths)))
     print(
         "step0003品種別廃棄控除前育成率ファイル数: "
