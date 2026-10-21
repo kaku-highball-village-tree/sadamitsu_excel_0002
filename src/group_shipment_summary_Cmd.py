@@ -79,6 +79,11 @@ STEP0003_ITEMS: List[Tuple[str, int, str, bool]] = [
     ("予備３羽数", 42, "予備３羽数", False),
     ("予備４羽数", 43, "予備４羽数", False),
 ]
+STEP0003_VARIETY_ADDITIONAL_ITEMS: List[Tuple[str, int, str, bool]] = [
+    ("農家廃棄羽数", 4, "農家廃棄羽数", False),
+    ("農家廃棄重量", 5, "農家廃棄重量", False),
+    ("日令", 19, "日令", True),
+]
 STEP0004_ITEMS: List[Tuple[str, bool]] = [
     ("入雛羽数", False),
     ("出荷羽数", False),
@@ -1542,6 +1547,78 @@ def create_step0003_files(
             raise_conversion_error(
                 "STEP0003_CLEANUP_FAILED",
                 "step0003 extraction failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def create_step0003_variety_additional_files(
+    arrStep0002VarietyPaths: List[str], iLatestYear: int
+) -> List[str]:
+    """品種別step0002から農家廃棄羽数・重量と日令を追加抽出します。"""
+    setTargetYears = set(range(iLatestYear - 4, iLatestYear + 1))
+    arrTargets: List[Tuple[int, int, str]] = []
+    for pszStep0002Path in arrStep0002VarietyPaths:
+        _, iYear, iMonth, _ = parse_step0002_file_name(
+            pszStep0002Path, True
+        )
+        if iYear in setTargetYears:
+            arrTargets.append((iYear, iMonth, pszStep0002Path))
+    arrTargets.sort()
+
+    arrCreatedPaths: List[str] = []
+    try:
+        for iExpectedYear, iExpectedMonth, pszStep0002Path in arrTargets:
+            for (
+                pszItemName,
+                iSourceColumnIndex,
+                pszSourceHeader,
+                bAllowBlank,
+            ) in STEP0003_VARIETY_ADDITIONAL_ITEMS:
+                pszStep0003Path = create_step0003_output_path(
+                    pszStep0002Path, pszItemName, True
+                )
+                try:
+                    iYear, iMonth = extract_step0003_item_tsv(
+                        pszStep0002Path,
+                        pszStep0003Path,
+                        pszItemName,
+                        iSourceColumnIndex,
+                        pszSourceHeader,
+                        bAllowBlank,
+                        True,
+                    )
+                except ConversionError as objException:
+                    raise_conversion_error(
+                        objException.pszErrorCode,
+                        "additional variety step0003 extraction failed. "
+                        "Input step0002 = " + pszStep0002Path
+                        + ", Target year/month = "
+                        + f"{iExpectedYear:04d}_{iExpectedMonth:02d}"
+                        + ", Item = " + pszItemName
+                        + ". Detail = " + str(objException),
+                    )
+                if (iYear, iMonth) != (iExpectedYear, iExpectedMonth):
+                    raise_conversion_error(
+                        "STEP0002_YEAR_MONTH_MISMATCH",
+                        "unexpected year/month returned for step0002. Path = "
+                        + pszStep0002Path,
+                    )
+                arrCreatedPaths.append(pszStep0003Path)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0003_VARIETY_ADDITIONAL_CLEANUP_FAILED",
+                "additional variety step0003 extraction failed. Original error = "
                 + str(objException)
                 + "; cleanup errors = "
                 + " | ".join(arrCleanupErrors),
@@ -10673,6 +10750,11 @@ def main() -> int:
         arrStep0003VarietyPaths, arrStep0003VarietyYearMonths = create_step0003_files(
             arrVarietyTsvPaths, objLastYearMonth[0], True
         )
+        arrStep0003VarietyAdditionalPaths = (
+            create_step0003_variety_additional_files(
+                arrVarietyTsvPaths, objLastYearMonth[0]
+            )
+        )
         arrStep0007VarietyPaths = create_step0007_variety_files(
             arrStep0003VarietyPaths, arrStep0003VarietyYearMonths
         )
@@ -10904,6 +10986,10 @@ def main() -> int:
     for pszPath in arrTotalTsvPaths:
         print("step0002総計ファイル: " + pszPath)
     print("step0003品種別ファイル数: " + str(len(arrStep0003VarietyPaths)))
+    print(
+        "step0003品種別追加抽出ファイル数: "
+        + str(len(arrStep0003VarietyAdditionalPaths))
+    )
     print("step0003品種別控除後計算ファイル数: " + str(len(arrStep0007VarietyPaths)))
     print("集計グループ数: 3")
     print("最初の年月: " + f"{objFirstYearMonth[0]:04d}_{objFirstYearMonth[1]:02d}")
