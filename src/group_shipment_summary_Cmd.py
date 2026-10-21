@@ -11375,6 +11375,16 @@ def write_step0008_tsv(
 def format_growth_rate_warning(
     iWarningNumber: int, dicWarning: Dict[str, str]
 ) -> str:
+    if "variety_name" in dicWarning:
+        pszTargetInfo = (
+            "品種No.: " + dicWarning["variety_number"] + "\r\n"
+            + "品種名: " + dicWarning["variety_name"] + "\r\n"
+        )
+    else:
+        pszTargetInfo = (
+            "グループ№: " + dicWarning["group_number"] + "\r\n"
+            + "グループ名: " + dicWarning["group_name"] + "\r\n"
+        )
     return (
         "\r\n[警告 "
         + str(iWarningNumber)
@@ -11387,10 +11397,8 @@ def format_growth_rate_warning(
         + dicWarning["output"]
         + "\r\n処理年月: "
         + dicWarning["month"]
-        + "\r\nグループ№: "
-        + dicWarning["group_number"]
-        + "\r\nグループ名: "
-        + dicWarning["group_name"]
+        + "\r\n"
+        + pszTargetInfo
         + "\r\n対象列: 入雛羽数, 出荷羽数\r\n"
         + "警告理由: 入雛羽数が0のため育成率を計算できません。\r\n"
         + "出力値: empty\r\n"
@@ -11541,6 +11549,195 @@ def create_step0008_files(
                 "step0008 creation failed. Original error = "
                 + str(objException)
                 + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
+def read_step0007_variety_annual_for_step0008(
+    pszInputPath: str,
+) -> Tuple[List[List[str]], int]:
+    objFileNameMatch = re.search(
+        r"_step0007_品種別_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0007_VARIETY_FILENAME",
+            "unexpected variety step0007 file name. Path = " + pszInputPath,
+        )
+    iExpectedYear = int(objFileNameMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0007_VARIETY_READ_FAILED",
+            "failed to read variety step0007 TSV. Path = "
+            + pszInputPath + ", Detail = " + str(objException),
+        )
+
+    arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
+    for _, pszVarietyName in VARIETIES:
+        arrExpectedStructure.extend(
+            (pszVarietyName if iItemIndex == 0 else "", pszItemName)
+            for iItemIndex, (pszItemName, _, _) in enumerate(
+                STEP0004_VARIETY_ITEMS
+            )
+        )
+    if len(arrRows) != len(arrExpectedStructure):
+        raise_conversion_error(
+            "INVALID_STEP0007_VARIETY_ROW_COUNT",
+            "variety step0007 must contain 26 rows. Path = " + pszInputPath,
+        )
+    iColumnCount = len(arrRows[0])
+    if iColumnCount < 3 or any(
+        len(arrRow) != iColumnCount for arrRow in arrRows
+    ):
+        raise_conversion_error(
+            "INVALID_STEP0007_VARIETY_COLUMN_COUNT",
+            "variety step0007 rows must have equal columns and at least one "
+            "data month. Path = " + pszInputPath,
+        )
+    for iRowIndex, objExpected in enumerate(arrExpectedStructure):
+        objActual = tuple(
+            pszValue.strip(" \u3000\t") for pszValue in arrRows[iRowIndex][:2]
+        )
+        if objActual != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0007_VARIETY_ROW_STRUCTURE",
+                "unexpected variety step0007 row structure. Path = "
+                + pszInputPath + ", Line = " + str(iRowIndex + 1),
+            )
+
+    arrMonths: List[int] = []
+    for iColumnIndex in range(2, iColumnCount):
+        iYear, iMonth = parse_year_month(
+            arrRows[0][iColumnIndex],
+            arrRows[1][iColumnIndex],
+            iColumnIndex + 1,
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0007_VARIETY_YEAR",
+                "variety step0007 year did not match its file name. Path = "
+                + pszInputPath + ", Column = " + str(iColumnIndex + 1),
+            )
+        if iMonth in arrMonths or (arrMonths and iMonth <= arrMonths[-1]):
+            raise_conversion_error(
+                "INVALID_STEP0007_VARIETY_MONTH",
+                "variety step0007 months must be unique and ascending. Path = "
+                + pszInputPath,
+            )
+        arrMonths.append(iMonth)
+        for iVarietyIndex, (_, pszVarietyName) in enumerate(VARIETIES):
+            iVarietyStart = 2 + iVarietyIndex * len(STEP0004_VARIETY_ITEMS)
+            for iItemOffset, (pszItemName, _, bAllowBlank) in enumerate(
+                STEP0004_VARIETY_ITEMS
+            ):
+                iRowIndex = iVarietyStart + iItemOffset
+                try:
+                    objValue = parse_decimal_value(
+                        arrRows[iRowIndex][iColumnIndex],
+                        iRowIndex + 1,
+                        iColumnIndex,
+                        pszItemName,
+                    )
+                except ConversionError as objException:
+                    raise_conversion_error(
+                        "INVALID_STEP0007_VARIETY_ITEM_VALUE",
+                        "invalid variety step0007 item value. Path = "
+                        + pszInputPath + ", Variety = " + pszVarietyName
+                        + ", Item = " + pszItemName
+                        + ". Detail = " + str(objException),
+                    )
+                if objValue is None and not bAllowBlank:
+                    raise_conversion_error(
+                        "INVALID_STEP0007_VARIETY_ITEM_VALUE",
+                        "variety step0007 item value was blank. Path = "
+                        + pszInputPath + ", Variety = " + pszVarietyName
+                        + ", Item = " + pszItemName
+                        + ", Column = " + str(iColumnIndex + 1),
+                    )
+    return arrRows, iExpectedYear
+
+
+def create_step0008_variety_annual_files(
+    arrStep0007VarietyPaths: List[str],
+    pszInputExcelPath: str,
+    pszExistingWarningPath: str,
+    iExistingWarningCount: int,
+) -> Tuple[List[str], str, int]:
+    """品種別step0007年間TSVへ、品種ごとの育成率行を追加します。"""
+    arrCreatedPaths: List[str] = []
+    arrWarnings: List[Dict[str, str]] = []
+    try:
+        for pszStep0007Path in arrStep0007VarietyPaths:
+            arrInputRows, iYear = read_step0007_variety_annual_for_step0008(
+                pszStep0007Path
+            )
+            pszOutputPath = create_step0008_output_path(pszStep0007Path)
+            arrOutputRows = [list(arrInputRows[0]), list(arrInputRows[1])]
+            arrMonths = arrInputRows[1][2:]
+            for iVarietyIndex, (pszVarietyNumber, pszVarietyName) in enumerate(
+                VARIETIES
+            ):
+                iVarietyStart = 2 + iVarietyIndex * len(STEP0004_VARIETY_ITEMS)
+                arrVarietyRows = [
+                    list(arrRow)
+                    for arrRow in arrInputRows[
+                        iVarietyStart : iVarietyStart
+                        + len(STEP0004_VARIETY_ITEMS)
+                    ]
+                ]
+                arrGrowthRateRow = ["", "育成率"]
+                for iValueIndex, pszMonth in enumerate(arrMonths, start=2):
+                    pszGrowthRate, bDivisionByZero = calculate_growth_rate(
+                        arrVarietyRows[0][iValueIndex],
+                        arrVarietyRows[1][iValueIndex],
+                    )
+                    arrGrowthRateRow.append(pszGrowthRate)
+                    if bDivisionByZero:
+                        arrWarnings.append(
+                            {
+                                "type": "GROWTH_RATE_DIVISION_BY_ZERO",
+                                "input": pszStep0007Path,
+                                "output": pszOutputPath,
+                                "month": f"{iYear:04d}{int(pszMonth):02d}",
+                                "variety_number": pszVarietyNumber,
+                                "variety_name": pszVarietyName,
+                            }
+                        )
+                arrOutputRows.extend(arrVarietyRows)
+                arrOutputRows.append(arrGrowthRateRow)
+            write_step0008_tsv(pszOutputPath, arrOutputRows)
+            arrCreatedPaths.append(pszOutputPath)
+
+        pszWarningPath = write_growth_rate_warnings(
+            pszInputExcelPath,
+            pszExistingWarningPath,
+            iExistingWarningCount,
+            arrWarnings,
+        )
+        return (
+            arrCreatedPaths,
+            pszWarningPath,
+            iExistingWarningCount + len(arrWarnings),
+        )
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0008_VARIETY_CLEANUP_FAILED",
+                "variety step0008 creation failed. Original error = "
+                + str(objException) + "; cleanup errors = "
                 + " | ".join(arrCleanupErrors),
             )
         raise
@@ -12889,6 +13086,16 @@ def main() -> int:
             pszOutputTsvPath, arrStep0006VarietyPaths
         )
         (
+            arrStep0008VarietyAnnualPaths,
+            pszWarningPath,
+            iWarningCount,
+        ) = create_step0008_variety_annual_files(
+            arrStep0007VarietyAnnualPaths,
+            pszInputExcelPath,
+            pszWarningPath,
+            iWarningCount,
+        )
+        (
             arrStep0004VarietyDeductionPaths,
             arrStep0004VarietyDeductionYearMonths,
         ) = create_step0004_variety_deduction_files(
@@ -13173,6 +13380,10 @@ def main() -> int:
     print(
         "step0007品種別年間ファイル数: "
         + str(len(arrStep0007VarietyAnnualPaths))
+    )
+    print(
+        "step0008品種別年間ファイル数: "
+        + str(len(arrStep0008VarietyAnnualPaths))
     )
     print(
         "step0003品種別廃棄控除前育成率ファイル数: "
