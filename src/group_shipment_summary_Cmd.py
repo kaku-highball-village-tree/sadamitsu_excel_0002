@@ -1851,7 +1851,7 @@ def create_step0003_variety_deduction_growth_rate_output_path(
         )
     iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
     pszStem = (
-        f"{objMatch.group(1)}_step0003_品種別_控除廃棄_育成率_"
+        f"{objMatch.group(1)}_step0003_品種別_廃棄控除後育成率_"
         f"{iYear:04d}_{iMonth:02d}{objMatch.group(4)}"
     )
     pszDirectory = os.path.dirname(pszPlacementPath)
