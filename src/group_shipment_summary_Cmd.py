@@ -12883,8 +12883,8 @@ def main() -> int:
             arrStep0005VarietyPaths
         )
         (
-            arrStep0007VarietyPaths,
-            arrStep0007VarietyYears,
+            arrStep0007VarietyAnnualPaths,
+            arrStep0007VarietyAnnualYears,
         ) = create_step0007_variety_annual_files(
             pszOutputTsvPath, arrStep0006VarietyPaths
         )
@@ -13169,8 +13169,11 @@ def main() -> int:
     )
     print("step0005品種別年間ファイル数: " + str(len(arrStep0005VarietyPaths)))
     print("step0006品種別年間ファイル数: " + str(len(arrStep0006VarietyPaths)))
-    print("step0007品種別対象年数: " + str(len(arrStep0007VarietyYears)))
-    print("step0007品種別年間ファイル数: " + str(len(arrStep0007VarietyPaths)))
+    print("step0007品種別対象年数: " + str(len(arrStep0007VarietyAnnualYears)))
+    print(
+        "step0007品種別年間ファイル数: "
+        + str(len(arrStep0007VarietyAnnualPaths))
+    )
     print(
         "step0003品種別廃棄控除前育成率ファイル数: "
         + str(len(arrStep0003VarietyPreDiscardGrowthRatePaths))
