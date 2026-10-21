@@ -1973,6 +1973,119 @@ def create_step0003_variety_deduction_growth_rate_files(
         raise
 
 
+def create_step0003_variety_pre_discard_growth_rate_output_path(
+    pszPlacementPath: str,
+) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0003_品種別_入雛羽数_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszPlacementPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0003_VARIETY_PLACEMENT_FILE_NAME",
+            "invalid variety placement step0003 file name. Path = "
+            + pszPlacementPath,
+        )
+    iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
+    pszStem = (
+        f"{objMatch.group(1)}_step0003_品種別_廃棄控除前育成率_"
+        f"{iYear:04d}_{iMonth:02d}{objMatch.group(4)}"
+    )
+    pszDirectory = os.path.dirname(pszPlacementPath)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0003_variety_pre_discard_growth_rate_files(
+    arrStep0003VarietyPaths: List[str],
+    arrStep0003YearMonths: List[Tuple[int, int]],
+) -> List[str]:
+    """出荷羽数と入雛羽数から品種別の廃棄控除前育成率を作成します。"""
+    dicStep0003Paths = build_step0003_path_map(
+        arrStep0003VarietyPaths, arrStep0003YearMonths
+    )
+    arrCreatedPaths: List[str] = []
+    try:
+        for iYear, iMonth in arrStep0003YearMonths:
+            dicPlacementRows = read_step0003_for_step0004(
+                dicStep0003Paths[(iYear, iMonth, "入雛羽数")],
+                "入雛羽数",
+                False,
+                iYear,
+                iMonth,
+                True,
+            )
+            dicShipmentRows = read_step0003_for_step0004(
+                dicStep0003Paths[(iYear, iMonth, "出荷羽数")],
+                "出荷羽数",
+                False,
+                iYear,
+                iMonth,
+                True,
+            )
+            arrOutputRows: List[str] = []
+            for pszVarietyNumber, pszVarietyName in VARIETIES:
+                objVarietyKey = (pszVarietyNumber, pszVarietyName)
+                arrPlacementFields = dicPlacementRows[objVarietyKey]
+                arrShipmentFields = dicShipmentRows[objVarietyKey]
+                if arrPlacementFields[:4] != arrShipmentFields[:4]:
+                    raise_conversion_error(
+                        "STEP0003_VARIETY_PRE_DISCARD_GROWTH_RATE_KEY_MISMATCH",
+                        "placement and shipment count keys did not match. "
+                        "Year/month = " + f"{iYear:04d}_{iMonth:02d}"
+                        + ", Variety = " + str(objVarietyKey),
+                    )
+                objPlacementCount = Decimal(arrPlacementFields[4])
+                objShipmentCount = Decimal(arrShipmentFields[4])
+                objGrowthRate = (
+                    (objShipmentCount / objPlacementCount).quantize(
+                        Decimal("0.0001"), rounding=ROUND_HALF_UP
+                    )
+                    if objPlacementCount != 0
+                    else Decimal("0")
+                )
+                arrOutputRows.append(
+                    "\t".join(
+                        arrPlacementFields[:4] + [format_sum_value(objGrowthRate)]
+                    )
+                )
+
+            pszOutputPath = (
+                create_step0003_variety_pre_discard_growth_rate_output_path(
+                    dicStep0003Paths[(iYear, iMonth, "入雛羽数")]
+                )
+            )
+            write_monthly_tsv(
+                pszOutputPath,
+                "\t".join(["年", "月", "品種No.", "品種名", "育成率"]),
+                arrOutputRows,
+            )
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0003_VARIETY_PRE_DISCARD_GROWTH_RATE_CLEANUP_FAILED",
+                "variety pre-discard growth rate creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 def parse_step0002_total_file_name(pszStep0002Path: str) -> Tuple[str, int, int, str]:
     pszFileName: str = os.path.basename(pszStep0002Path)
     objMatch = re.fullmatch(
@@ -10973,6 +11086,12 @@ def main() -> int:
         arrStep0003VarietyPaths, arrStep0003VarietyYearMonths = create_step0003_files(
             arrVarietyTsvPaths, objLastYearMonth[0], True
         )
+        arrStep0003VarietyPreDiscardGrowthRatePaths = (
+            create_step0003_variety_pre_discard_growth_rate_files(
+                arrStep0003VarietyPaths,
+                arrStep0003VarietyYearMonths,
+            )
+        )
         arrStep0003VarietyAdditionalPaths = (
             create_step0003_variety_additional_files(
                 arrVarietyTsvPaths, objLastYearMonth[0]
@@ -11229,6 +11348,10 @@ def main() -> int:
     for pszPath in arrTotalTsvPaths:
         print("step0002総計ファイル: " + pszPath)
     print("step0003品種別ファイル数: " + str(len(arrStep0003VarietyPaths)))
+    print(
+        "step0003品種別廃棄控除前育成率ファイル数: "
+        + str(len(arrStep0003VarietyPreDiscardGrowthRatePaths))
+    )
     print(
         "step0003品種別追加抽出ファイル数: "
         + str(len(arrStep0003VarietyAdditionalPaths))
