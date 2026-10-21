@@ -9979,6 +9979,187 @@ def create_step0006_variety_files(
         raise
 
 
+def read_step0005_variety_deduction_for_step0006(
+    pszInputPath: str,
+) -> List[List[str]]:
+    """控除廃棄版の品種別step0005年間TSVを検証して読み込みます。"""
+    objFileNameMatch = re.search(
+        r"_step0005_品種別_控除廃棄_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+        r"(\d{4})_年間(?:_\d+)?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0005_VARIETY_DEDUCTION_FILENAME",
+            "unexpected variety deduction step0005 file name. Path = "
+            + pszInputPath,
+        )
+    pszExpectedVarietyName = objFileNameMatch.group(1)
+    iExpectedYear = int(objFileNameMatch.group(2))
+    dicVarietyNumbers = {
+        pszName: pszNumber for pszNumber, pszName in VARIETIES
+    }
+    pszExpectedVarietyNumber = dicVarietyNumbers[pszExpectedVarietyName]
+
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0005_VARIETY_DEDUCTION_READ_FAILED",
+            "failed to read variety deduction step0005 TSV. Path = "
+            + pszInputPath + ", Detail = " + str(objException),
+        )
+
+    arrExpectedHeader = STEP0004_VARIETY_DEDUCTION_HEADER.split("\t")
+    if len(arrRows) < 2:
+        raise_conversion_error(
+            "INVALID_STEP0005_VARIETY_DEDUCTION_ROW_COUNT",
+            "variety deduction step0005 must contain one header and at least "
+            "one data row. Path = " + pszInputPath,
+        )
+    if [pszValue.strip(" \u3000\t") for pszValue in arrRows[0]] != arrExpectedHeader:
+        raise_conversion_error(
+            "INVALID_STEP0005_VARIETY_DEDUCTION_HEADER",
+            "unexpected variety deduction step0005 header. Path = "
+            + pszInputPath,
+        )
+
+    iPreviousMonth = 0
+    setMonths = set()
+    for iLineNumber, arrFields in enumerate(arrRows[1:], start=2):
+        if len(arrFields) != len(arrExpectedHeader):
+            raise_conversion_error(
+                "INVALID_STEP0005_VARIETY_DEDUCTION_COLUMN_COUNT",
+                "variety deduction step0005 row must contain 10 columns. "
+                "Path = " + pszInputPath + ", Line = " + str(iLineNumber),
+            )
+        iYear, iMonth = parse_year_month(
+            arrFields[0], arrFields[1], iLineNumber
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0005_VARIETY_DEDUCTION_YEAR",
+                "variety deduction step0005 year did not match its file name. "
+                "Path = " + pszInputPath + ", Line = " + str(iLineNumber),
+            )
+        if iMonth in setMonths or iMonth <= iPreviousMonth:
+            raise_conversion_error(
+                "INVALID_STEP0005_VARIETY_DEDUCTION_MONTH_ORDER",
+                "variety deduction step0005 months must be unique and "
+                "ascending. Path = " + pszInputPath,
+            )
+        setMonths.add(iMonth)
+        iPreviousMonth = iMonth
+        if arrFields[2:4] != [
+            pszExpectedVarietyNumber,
+            pszExpectedVarietyName,
+        ]:
+            raise_conversion_error(
+                "INVALID_STEP0005_VARIETY_DEDUCTION_VARIETY",
+                "variety deduction step0005 variety did not match its file "
+                "name. Path = " + pszInputPath + ", Line = " + str(iLineNumber),
+            )
+        for iColumnIndex, (pszItemName, _, bAllowBlank) in enumerate(
+            STEP0004_VARIETY_DEDUCTION_ITEMS, start=4
+        ):
+            try:
+                objValue = parse_decimal_value(
+                    arrFields[iColumnIndex],
+                    iLineNumber,
+                    iColumnIndex,
+                    pszItemName,
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "INVALID_STEP0005_VARIETY_DEDUCTION_ITEM_VALUE",
+                    "invalid variety deduction step0005 item value. Path = "
+                    + pszInputPath + ", Line = " + str(iLineNumber)
+                    + ", Item = " + pszItemName
+                    + ". Detail = " + str(objException),
+                )
+            if objValue is None and not bAllowBlank:
+                raise_conversion_error(
+                    "INVALID_STEP0005_VARIETY_DEDUCTION_ITEM_VALUE",
+                    "variety deduction step0005 item value was blank. Path = "
+                    + pszInputPath + ", Line = " + str(iLineNumber)
+                    + ", Item = " + pszItemName,
+                )
+    return arrRows
+
+
+def create_step0006_variety_deduction_files(
+    arrStep0005VarietyDeductionPaths: List[str],
+) -> List[str]:
+    """控除廃棄版の品種別step0005年間TSVを行列入れ替えしてstep0006を作成します。"""
+    dicInputs: Dict[Tuple[int, str], str] = {}
+    for pszPath in arrStep0005VarietyDeductionPaths:
+        objMatch = re.search(
+            r"_step0005_品種別_控除廃棄_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+            r"(\d{4})_年間(?:_\d+)?\.tsv$",
+            os.path.basename(pszPath),
+        )
+        if objMatch is None:
+            raise_conversion_error(
+                "INVALID_STEP0005_VARIETY_DEDUCTION_FILENAME",
+                "unexpected variety deduction step0005 file name. Path = "
+                + pszPath,
+            )
+        objKey = (int(objMatch.group(2)), objMatch.group(1))
+        if objKey in dicInputs:
+            raise_conversion_error(
+                "DUPLICATE_STEP0005_VARIETY_DEDUCTION_YEAR",
+                "duplicate variety deduction step0005 year input. Key = "
+                + str(objKey),
+            )
+        dicInputs[objKey] = pszPath
+
+    setYears = {iYear for iYear, _ in dicInputs}
+    setExpectedKeys = {
+        (iYear, pszVarietyName)
+        for iYear in setYears
+        for _, pszVarietyName in VARIETIES
+    }
+    if set(dicInputs) != setExpectedKeys:
+        raise_conversion_error(
+            "INVALID_STEP0005_VARIETY_DEDUCTION_PATH_COUNT",
+            "variety deduction step0005 paths must contain all four "
+            "varieties for each year. Expected = " + str(len(setExpectedKeys))
+            + ", Actual = " + str(len(dicInputs)),
+        )
+
+    arrCreatedPaths: List[str] = []
+    try:
+        for iYear in sorted(setYears):
+            for _, pszVarietyName in VARIETIES:
+                pszInputPath = dicInputs[(iYear, pszVarietyName)]
+                arrInputRows = read_step0005_variety_deduction_for_step0006(
+                    pszInputPath
+                )
+                arrTransposedRows = transpose_tsv_rows(arrInputRows)
+                pszOutputPath = create_step0006_output_path(pszInputPath)
+                write_step0006_tsv(pszOutputPath, arrTransposedRows)
+                arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0006_VARIETY_DEDUCTION_CLEANUP_FAILED",
+                "variety deduction step0006 creation failed. Original error = "
+                + str(objException) + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 def create_step0007_output_path(pszSourceTsvPath: str, iYear: int) -> str:
     pszDirectory: str = os.path.dirname(pszSourceTsvPath)
     pszBaseName: str = os.path.splitext(os.path.basename(pszSourceTsvPath))[0]
@@ -12157,6 +12338,11 @@ def main() -> int:
             arrStep0004VarietyDeductionPaths,
             arrStep0004VarietyDeductionYearMonths,
         )
+        arrStep0006VarietyDeductionPaths = (
+            create_step0006_variety_deduction_files(
+                arrStep0005VarietyDeductionPaths
+            )
+        )
         arrStep0003Paths, arrStep0003YearMonths = create_step0003_files(
             arrAggregatedTsvPaths, objLastYearMonth[0]
         )
@@ -12393,6 +12579,10 @@ def main() -> int:
     print(
         "step0005品種別控除廃棄年間ファイル数: "
         + str(len(arrStep0005VarietyDeductionPaths))
+    )
+    print(
+        "step0006品種別控除廃棄年間ファイル数: "
+        + str(len(arrStep0006VarietyDeductionPaths))
     )
     print("step0005品種別年間ファイル数: " + str(len(arrStep0005VarietyPaths)))
     print("step0006品種別年間ファイル数: " + str(len(arrStep0006VarietyPaths)))
