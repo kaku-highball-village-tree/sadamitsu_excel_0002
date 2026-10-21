@@ -1836,6 +1836,143 @@ def create_step0007_variety_files(
         raise
 
 
+def create_step0003_variety_deduction_growth_rate_output_path(
+    pszPlacementPath: str,
+) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0003_品種別_入雛羽数_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszPlacementPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0003_VARIETY_PLACEMENT_FILE_NAME",
+            "invalid variety placement step0003 file name. Path = "
+            + pszPlacementPath,
+        )
+    iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
+    pszStem = (
+        f"{objMatch.group(1)}_step0003_品種別_控除廃棄_育成率_"
+        f"{iYear:04d}_{iMonth:02d}{objMatch.group(4)}"
+    )
+    pszDirectory = os.path.dirname(pszPlacementPath)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0003_variety_deduction_growth_rate_files(
+    arrStep0003VarietyPaths: List[str],
+    arrStep0007VarietyPaths: List[str],
+    arrStep0003YearMonths: List[Tuple[int, int]],
+) -> List[str]:
+    """入雛羽数と処理羽数から品種別の控除廃棄育成率を作成します。"""
+    dicStep0003Paths = build_step0003_path_map(
+        arrStep0003VarietyPaths, arrStep0003YearMonths
+    )
+    dicProcessedPaths: Dict[Tuple[int, int], str] = {}
+    for pszPath in arrStep0007VarietyPaths:
+        objMatch = re.fullmatch(
+            r".+_step0003_品種別_処理羽数_(\d{4})_(\d{2})(?:_\d+)*\.tsv",
+            os.path.basename(pszPath),
+        )
+        if objMatch is None:
+            continue
+        iYear, iMonth = parse_year_month(objMatch.group(1), objMatch.group(2), 1)
+        objKey = (iYear, iMonth)
+        if objKey in dicProcessedPaths:
+            raise_conversion_error(
+                "DUPLICATE_STEP0003_VARIETY_PROCESSED_COUNT",
+                "duplicate variety processed count input. Year/month = "
+                + f"{iYear:04d}_{iMonth:02d}",
+            )
+        dicProcessedPaths[objKey] = pszPath
+
+    setExpectedYearMonths = set(arrStep0003YearMonths)
+    if set(dicProcessedPaths) != setExpectedYearMonths:
+        raise_conversion_error(
+            "STEP0003_VARIETY_PROCESSED_COUNT_INPUT_MISMATCH",
+            "variety processed count inputs did not match step0003 year/months.",
+        )
+
+    arrCreatedPaths: List[str] = []
+    try:
+        for iYear, iMonth in arrStep0003YearMonths:
+            dicPlacementRows = read_step0003_for_step0004(
+                dicStep0003Paths[(iYear, iMonth, "入雛羽数")],
+                "入雛羽数",
+                False,
+                iYear,
+                iMonth,
+                True,
+            )
+            dicProcessedRows = read_step0003_for_step0004(
+                dicProcessedPaths[(iYear, iMonth)],
+                "処理羽数",
+                False,
+                iYear,
+                iMonth,
+                True,
+            )
+            arrOutputRows: List[str] = []
+            for pszVarietyNumber, pszVarietyName in VARIETIES:
+                objVarietyKey = (pszVarietyNumber, pszVarietyName)
+                arrPlacementFields = dicPlacementRows[objVarietyKey]
+                arrProcessedFields = dicProcessedRows[objVarietyKey]
+                if arrPlacementFields[:4] != arrProcessedFields[:4]:
+                    raise_conversion_error(
+                        "STEP0003_VARIETY_GROWTH_RATE_KEY_MISMATCH",
+                        "placement and processed count keys did not match. "
+                        "Year/month = " + f"{iYear:04d}_{iMonth:02d}"
+                        + ", Variety = " + str(objVarietyKey),
+                    )
+                objPlacementCount = Decimal(arrPlacementFields[4])
+                objProcessedCount = Decimal(arrProcessedFields[4])
+                objGrowthRate = (
+                    (objProcessedCount / objPlacementCount).quantize(
+                        Decimal("0.0001"), rounding=ROUND_HALF_UP
+                    )
+                    if objPlacementCount != 0
+                    else Decimal("0")
+                )
+                arrOutputRows.append(
+                    "\t".join(
+                        arrPlacementFields[:4] + [format_sum_value(objGrowthRate)]
+                    )
+                )
+
+            pszOutputPath = create_step0003_variety_deduction_growth_rate_output_path(
+                dicStep0003Paths[(iYear, iMonth, "入雛羽数")]
+            )
+            write_monthly_tsv(
+                pszOutputPath,
+                "\t".join(["年", "月", "品種No.", "品種名", "育成率"]),
+                arrOutputRows,
+            )
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0003_VARIETY_GROWTH_RATE_CLEANUP_FAILED",
+                "variety deduction growth rate creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 def parse_step0002_total_file_name(pszStep0002Path: str) -> Tuple[str, int, int, str]:
     pszFileName: str = os.path.basename(pszStep0002Path)
     objMatch = re.fullmatch(
@@ -10857,6 +10994,13 @@ def main() -> int:
         arrStep0007VarietyPaths = create_step0007_variety_files(
             arrStep0003VarietyPaths, arrStep0003VarietyYearMonths
         )
+        arrStep0003VarietyDeductionGrowthRatePaths = (
+            create_step0003_variety_deduction_growth_rate_files(
+                arrStep0003VarietyPaths,
+                arrStep0007VarietyPaths,
+                arrStep0003VarietyYearMonths,
+            )
+        )
         arrStep0003Paths, arrStep0003YearMonths = create_step0003_files(
             arrAggregatedTsvPaths, objLastYearMonth[0]
         )
@@ -11094,6 +11238,10 @@ def main() -> int:
         + str(len(arrStep0003VarietyHusbandryAveragePaths))
     )
     print("step0003品種別控除後計算ファイル数: " + str(len(arrStep0007VarietyPaths)))
+    print(
+        "step0003品種別控除廃棄育成率ファイル数: "
+        + str(len(arrStep0003VarietyDeductionGrowthRatePaths))
+    )
     print("集計グループ数: 3")
     print("最初の年月: " + f"{objFirstYearMonth[0]:04d}_{objFirstYearMonth[1]:02d}")
     print("最後の年月: " + f"{objLastYearMonth[0]:04d}_{objLastYearMonth[1]:02d}")
