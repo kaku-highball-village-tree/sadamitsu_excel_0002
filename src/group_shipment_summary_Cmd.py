@@ -1626,6 +1626,92 @@ def create_step0003_variety_additional_files(
         raise
 
 
+def create_step0003_variety_husbandry_average_output_path(
+    pszDayAgePath: str,
+) -> str:
+    objMatch = re.fullmatch(
+        r"(.+)_step0003_品種別_日令_(\d{4})_(\d{2})((?:_\d+)*)\.tsv",
+        os.path.basename(pszDayAgePath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0003_VARIETY_DAY_AGE_FILE_NAME",
+            "invalid variety day-age step0003 file name. Path = "
+            + pszDayAgePath,
+        )
+    iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
+    pszStem = (
+        f"{objMatch.group(1)}_step0003_品種別_飼育日数平均_"
+        f"{iYear:04d}_{iMonth:02d}{objMatch.group(4)}"
+    )
+    pszDirectory = os.path.dirname(pszDayAgePath)
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".tsv")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}.tsv"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0003_variety_husbandry_average_files(
+    arrDayAgePaths: List[str],
+) -> List[str]:
+    """日令TSVを内容そのままで複製し、飼育日数平均名で保存します。"""
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszDayAgePath in sorted(arrDayAgePaths):
+            try:
+                with open(pszDayAgePath, "rb") as objInputFile:
+                    objContents = objInputFile.read()
+            except Exception as objException:
+                raise_conversion_error(
+                    "STEP0003_VARIETY_DAY_AGE_COPY_READ_FAILED",
+                    "failed to read variety day-age TSV. Path = "
+                    + pszDayAgePath + "; Detail = " + str(objException),
+                )
+
+            pszOutputPath = create_step0003_variety_husbandry_average_output_path(
+                pszDayAgePath
+            )
+            while True:
+                try:
+                    with open(pszOutputPath, "xb") as objOutputFile:
+                        arrCreatedPaths.append(pszOutputPath)
+                        objOutputFile.write(objContents)
+                    break
+                except FileExistsError:
+                    pszOutputPath = (
+                        create_step0003_variety_husbandry_average_output_path(
+                            pszDayAgePath
+                        )
+                    )
+                except Exception as objException:
+                    raise_conversion_error(
+                        "STEP0003_VARIETY_DAY_AGE_COPY_WRITE_FAILED",
+                        "failed to copy variety day-age TSV. Path = "
+                        + pszOutputPath + "; Detail = " + str(objException),
+                    )
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0003_VARIETY_DAY_AGE_COPY_CLEANUP_FAILED",
+                "variety husbandry average file creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 def create_step0007_variety_output_path(
     pszStep0003Path: str, pszItemName: str
 ) -> str:
@@ -10755,6 +10841,19 @@ def main() -> int:
                 arrVarietyTsvPaths, objLastYearMonth[0]
             )
         )
+        arrStep0003VarietyDayAgePaths = [
+            pszPath
+            for pszPath in arrStep0003VarietyAdditionalPaths
+            if re.fullmatch(
+                r".+_step0003_品種別_日令_\d{4}_\d{2}(?:_\d+)*\.tsv",
+                os.path.basename(pszPath),
+            )
+        ]
+        arrStep0003VarietyHusbandryAveragePaths = (
+            create_step0003_variety_husbandry_average_files(
+                arrStep0003VarietyDayAgePaths
+            )
+        )
         arrStep0007VarietyPaths = create_step0007_variety_files(
             arrStep0003VarietyPaths, arrStep0003VarietyYearMonths
         )
@@ -10989,6 +11088,10 @@ def main() -> int:
     print(
         "step0003品種別追加抽出ファイル数: "
         + str(len(arrStep0003VarietyAdditionalPaths))
+    )
+    print(
+        "step0003品種別飼育日数平均ファイル数: "
+        + str(len(arrStep0003VarietyHusbandryAveragePaths))
     )
     print("step0003品種別控除後計算ファイル数: " + str(len(arrStep0007VarietyPaths)))
     print("集計グループ数: 3")
