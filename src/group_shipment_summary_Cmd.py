@@ -217,8 +217,8 @@ def write_error_file(
                     "step0006年間行列入れ替え・step0007年間グループ連結・"
                     "step0007年間Excel作成・step0008育成率追加・"
                     "品種別控除廃棄step0008年間TSV作成・"
-                    "品種別step0009年間TSV作成・"
-                    "品種別step0009年間Excel作成に"
+                    "品種別step0009年間TSV作成・Excel作成・"
+                    "控除廃棄品種別step0009年間TSV作成に"
                     "失敗しました。\r\n"
                 )
                 objErrorFile.write("エラー種別: " + pszErrorCode + "\r\n")
@@ -12695,6 +12695,225 @@ def create_step0009_excel_files(
         raise
 
 
+def read_step0008_variety_deduction_for_step0009(
+    pszInputPath: str,
+) -> List[List[str]]:
+    """控除廃棄版品種別step0008年間TSVを検証して読み込みます。"""
+    objFileNameMatch = re.search(
+        r"_step0008_品種別_控除廃棄_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0008_VARIETY_DEDUCTION_FILENAME",
+            "unexpected variety deduction step0008 file name. Path = "
+            + pszInputPath,
+        )
+    iExpectedYear: int = int(objFileNameMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows: List[List[str]] = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0008_VARIETY_DEDUCTION_READ_FAILED",
+            "failed to read variety deduction step0008 TSV. Path = "
+            + pszInputPath + ", Detail = " + str(objException),
+        )
+
+    arrItemNames: List[str] = [
+        pszName for pszName, _, _ in STEP0004_VARIETY_DEDUCTION_ITEMS
+    ] + ["育成率"]
+    arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
+    for _, pszVarietyName in VARIETIES:
+        for iItemIndex, pszItemName in enumerate(arrItemNames):
+            arrExpectedStructure.append(
+                (pszVarietyName if iItemIndex == 0 else "", pszItemName)
+            )
+    if len(arrRows) != len(arrExpectedStructure):
+        raise_conversion_error(
+            "INVALID_STEP0008_VARIETY_DEDUCTION_ROW_COUNT",
+            "variety deduction step0008 must contain 30 rows. Path = "
+            + pszInputPath,
+        )
+    iColumnCount: int = len(arrRows[0])
+    if iColumnCount < 3 or any(len(arrRow) != iColumnCount for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0008_VARIETY_DEDUCTION_COLUMN_COUNT",
+            "variety deduction step0008 rows must have equal columns and at "
+            "least one data month. Path = " + pszInputPath,
+        )
+    for iRowIndex, objExpected in enumerate(arrExpectedStructure):
+        objActual = tuple(
+            pszValue.strip(" \u3000\t") for pszValue in arrRows[iRowIndex][:2]
+        )
+        if objActual != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0008_VARIETY_DEDUCTION_ROW_STRUCTURE",
+                "unexpected variety deduction step0008 row structure. Path = "
+                + pszInputPath + ", Line = " + str(iRowIndex + 1),
+            )
+
+    arrMonths: List[int] = []
+    for iColumnIndex in range(2, iColumnCount):
+        iYear, iMonth = parse_year_month(
+            arrRows[0][iColumnIndex], arrRows[1][iColumnIndex], iColumnIndex + 1
+        )
+        if iYear != iExpectedYear:
+            raise_conversion_error(
+                "INVALID_STEP0008_VARIETY_DEDUCTION_YEAR",
+                "variety deduction step0008 year did not match its file name. "
+                "Path = " + pszInputPath,
+            )
+        if arrMonths and iMonth <= arrMonths[-1]:
+            raise_conversion_error(
+                "INVALID_STEP0008_VARIETY_DEDUCTION_MONTH",
+                "variety deduction step0008 months must be unique and "
+                "ascending. Path = " + pszInputPath,
+            )
+        arrMonths.append(iMonth)
+        for iRowIndex in range(2, len(arrRows)):
+            iItemOffset: int = (iRowIndex - 2) % len(arrItemNames)
+            pszItemName: str = arrItemNames[iItemOffset]
+            bAllowBlank: bool = (
+                STEP0004_VARIETY_DEDUCTION_ITEMS[iItemOffset][2]
+                if iItemOffset < len(STEP0004_VARIETY_DEDUCTION_ITEMS)
+                else True
+            )
+            try:
+                objValue = parse_decimal_value(
+                    arrRows[iRowIndex][iColumnIndex],
+                    iRowIndex + 1, iColumnIndex, pszItemName,
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "INVALID_STEP0008_VARIETY_DEDUCTION_ITEM_VALUE",
+                    "invalid variety deduction step0008 item value. Path = "
+                    + pszInputPath + ", Line = " + str(iRowIndex + 1)
+                    + ". Detail = " + str(objException),
+                )
+            if objValue is None and not bAllowBlank:
+                raise_conversion_error(
+                    "INVALID_STEP0008_VARIETY_DEDUCTION_ITEM_VALUE",
+                    "variety deduction step0008 item value was blank. Path = "
+                    + pszInputPath + ", Line = " + str(iRowIndex + 1)
+                    + ", Column = " + str(iColumnIndex + 1),
+                )
+    return arrRows
+
+
+def create_step0009_variety_deduction_annual_rows(
+    arrInputRows: List[List[str]],
+) -> List[List[str]]:
+    """控除廃棄版step0008に4品種合計行を加えてstep0009を作成します。"""
+    iItemsPerVariety: int = len(STEP0004_VARIETY_DEDUCTION_ITEMS) + 1
+    arrItemNames: List[str] = [
+        pszName for pszName, _, _ in STEP0004_VARIETY_DEDUCTION_ITEMS
+    ] + ["育成率"]
+    arrOutputRows: List[List[str]] = [
+        arrRow[:2] + [
+            format_sum_value(Decimal(pszValue.strip(" \u3000\t")))
+            if pszValue.strip(" \u3000\t") else ""
+            for pszValue in arrRow[2:]
+        ]
+        for arrRow in arrInputRows
+    ]
+    arrTotalRows: List[List[str]] = [
+        ["合計" if iItemIndex == 0 else "", pszItemName]
+        for iItemIndex, pszItemName in enumerate(arrItemNames)
+    ]
+    for iColumnIndex in range(2, len(arrInputRows[0])):
+        arrTotals: List[Decimal] = [
+            sum(
+                (
+                    Decimal(
+                        arrInputRows[
+                            2 + iVarietyIndex * iItemsPerVariety + iItemIndex
+                        ][iColumnIndex].strip(" \u3000\t")
+                    )
+                    for iVarietyIndex in range(len(VARIETIES))
+                ),
+                Decimal("0"),
+            )
+            for iItemIndex in range(3)
+        ]
+        objAverageWeight: Decimal = (
+            (arrTotals[2] / arrTotals[1]).quantize(
+                Decimal("0.001"), rounding=ROUND_HALF_UP
+            )
+            if arrTotals[1] != 0 else Decimal("0")
+        )
+        objAgeWeightedTotal: Decimal = Decimal("0")
+        objAgeWeightTotal: Decimal = Decimal("0")
+        for iVarietyIndex in range(len(VARIETIES)):
+            iVarietyStart: int = 2 + iVarietyIndex * iItemsPerVariety
+            pszAge: str = arrInputRows[iVarietyStart + 4][iColumnIndex].strip(
+                " \u3000\t"
+            )
+            if pszAge:
+                objProcessedCount: Decimal = Decimal(
+                    arrInputRows[iVarietyStart + 1][iColumnIndex].strip(
+                        " \u3000\t"
+                    )
+                )
+                objAgeWeightedTotal += Decimal(pszAge) * objProcessedCount
+                objAgeWeightTotal += objProcessedCount
+        objAverageAge: Decimal = (
+            (objAgeWeightedTotal / objAgeWeightTotal).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP
+            )
+            if objAgeWeightTotal != 0 else Decimal("0")
+        )
+        objGrowthRate: Decimal = (
+            (arrTotals[1] / arrTotals[0]).quantize(
+                Decimal("0.0001"), rounding=ROUND_HALF_UP
+            )
+            if arrTotals[0] != 0 else Decimal("0")
+        )
+        arrTotalValues: List[Decimal] = (
+            arrTotals[:3]
+            + [objAverageWeight, objAverageAge, objGrowthRate, objGrowthRate]
+        )
+        for arrRow, objValue in zip(arrTotalRows, arrTotalValues):
+            arrRow.append(format_sum_value(objValue))
+    return arrOutputRows + arrTotalRows
+
+
+def create_step0009_variety_deduction_annual_files(
+    arrStep0008VarietyDeductionPaths: List[str],
+) -> List[str]:
+    """控除廃棄版品種別step0008年間TSVから合計付きstep0009を作成します。"""
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0008Path in arrStep0008VarietyDeductionPaths:
+            arrInputRows = read_step0008_variety_deduction_for_step0009(
+                pszStep0008Path
+            )
+            pszOutputPath = create_step0009_output_path(pszStep0008Path)
+            arrOutputRows = create_step0009_variety_deduction_annual_rows(
+                arrInputRows
+            )
+            write_step0009_tsv(pszOutputPath, arrOutputRows)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0009_VARIETY_DEDUCTION_CLEANUP_FAILED",
+                "variety deduction step0009 creation failed. Original error = "
+                + str(objException) + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 def read_step0009_variety_for_excel(
     pszInputPath: str,
 ) -> List[List[str]]:
@@ -13803,6 +14022,11 @@ def main() -> int:
             pszWarningPath,
             iWarningCount,
         )
+        arrStep0009VarietyDeductionPaths = (
+            create_step0009_variety_deduction_annual_files(
+                arrStep0008VarietyDeductionPaths
+            )
+        )
         arrStep0003Paths, arrStep0003YearMonths = create_step0003_files(
             arrAggregatedTsvPaths, objLastYearMonth[0]
         )
@@ -14003,7 +14227,7 @@ def main() -> int:
         )
         pszErrorDetail: str = str(objException)
         print(
-            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 annual TSVs, create variety step0009 annual TSVs or Excel files, add annual totals, or add yearly total columns, or create step0013 group deduction Excel files. Detail = "
+            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 annual TSVs or Excel files, add annual totals, or add yearly total columns, or create step0013 group deduction Excel files. Detail = "
             + pszErrorDetail,
             file=sys.stderr,
         )
@@ -14055,6 +14279,10 @@ def main() -> int:
     print(
         "step0008品種別控除廃棄年間ファイル数: "
         + str(len(arrStep0008VarietyDeductionPaths))
+    )
+    print(
+        "step0009品種別控除廃棄年間ファイル数: "
+        + str(len(arrStep0009VarietyDeductionPaths))
     )
     print("step0005品種別年間ファイル数: " + str(len(arrStep0005VarietyPaths)))
     print("step0006品種別年間ファイル数: " + str(len(arrStep0006VarietyPaths)))
@@ -14260,7 +14488,7 @@ def main() -> int:
     print("警告件数: " + str(iWarningCount))
     if pszWarningPath:
         print("警告ファイル: " + pszWarningPath)
-    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・年間Excel作成・育成率追加・控除廃棄品種別step0008作成・step0008年間Excel作成・品種別step0009年間TSV・Excel作成・年間合計追加・step0009年間Excel作成・年間合計列追加・step0010年間Excel作成・step0013グループ別控除廃棄年間Excel作成完了 ◇")
+    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・年間Excel作成・育成率追加・控除廃棄品種別step0008・step0009年間TSV作成・step0008年間Excel作成・品種別step0009年間TSV・Excel作成・年間合計追加・step0009年間Excel作成・年間合計列追加・step0010年間Excel作成・step0013グループ別控除廃棄年間Excel作成完了 ◇")
     print("入力Excel: " + pszInputExcelPath)
     print("出力フォルダ: " + os.path.dirname(pszOutputTsvPath))
     return 0
