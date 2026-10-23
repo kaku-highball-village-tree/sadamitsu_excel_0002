@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict, List, NoReturn, Optional, Tuple
@@ -8082,6 +8083,56 @@ def create_step0012_discard_summary_excel_files(
                             )
                         else:
                             objCell.number_format = "0.#####"
+                for iColumnIndex in range(1, objWorksheet.max_column + 1):
+                    iMaximumDisplayWidth = 0
+                    for objCell in objWorksheet.iter_cols(
+                        min_col=iColumnIndex,
+                        max_col=iColumnIndex,
+                        min_row=1,
+                        max_row=objWorksheet.max_row,
+                    ):
+                        for objWidthCell in objCell:
+                            objValue = objWidthCell.value
+                            if objValue is None:
+                                continue
+                            if isinstance(objValue, (int, float, Decimal)):
+                                objDecimalValue = Decimal(str(objValue))
+                                pszFormat = objWidthCell.number_format.split(";")[0]
+                                pszIntegerFormat, _, pszFractionFormat = pszFormat.partition(".")
+                                iFractionPlaces = sum(
+                                    1 for pszCharacter in pszFractionFormat
+                                    if pszCharacter in "0#"
+                                )
+                                pszDisplayValue = format(
+                                    objDecimalValue,
+                                    ",." + str(iFractionPlaces) + "f"
+                                    if "," in pszIntegerFormat
+                                    else "." + str(iFractionPlaces) + "f",
+                                )
+                                if iFractionPlaces:
+                                    iMinimumFractionPlaces = pszFractionFormat.count("0")
+                                    while (
+                                        len(pszDisplayValue.rsplit(".", 1)[-1])
+                                        > iMinimumFractionPlaces
+                                        and pszDisplayValue.endswith("0")
+                                    ):
+                                        pszDisplayValue = pszDisplayValue[:-1]
+                                    if pszDisplayValue.endswith("."):
+                                        pszDisplayValue = pszDisplayValue[:-1]
+                            else:
+                                pszDisplayValue = str(objValue)
+                            iDisplayWidth = sum(
+                                2 if unicodedata.east_asian_width(pszCharacter)
+                                in {"F", "W"}
+                                else 1
+                                for pszCharacter in pszDisplayValue
+                            )
+                            iMaximumDisplayWidth = max(
+                                iMaximumDisplayWidth, iDisplayWidth
+                            )
+                    objWorksheet.column_dimensions[
+                        get_column_letter(iColumnIndex)
+                    ].width = min(iMaximumDisplayWidth + 2, 255)
                 objWorkbook.save(pszTemporaryPath)
                 objWorkbook.close()
                 objWorkbook = None
