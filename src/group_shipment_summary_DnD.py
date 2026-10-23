@@ -348,6 +348,7 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "step0011総計廃棄データ一覧表を出力します。\n"
         "前年同月の羽数合計との比率をZ列に追加した\n"
         "step0012総計廃棄データ一覧表を出力します。\n"
+        "step0012総計廃棄データ一覧表TSVから同名のExcelファイルを出力します。\n"
         "主要4項目をグループ別TSVへ結合し、\n"
         "年・グループ別の年間TSVへ連結し、\n"
         "年間TSVの行と列を入れ替え、\n"
