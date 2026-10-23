@@ -27,6 +27,15 @@ VARIETIES: List[Tuple[str, str]] = [
     ("2", "地養鳥"),
     ("1", "ブロイラー"),
 ]
+BROILER_BREAKDOWNS: List[Tuple[str, str]] = [
+    ("1", "ブロイラー（貞光分）"),
+    ("1", "ブロイラー(外部購入)"),
+]
+STEP0002_VARIETIES: List[Tuple[str, str]] = VARIETIES + BROILER_BREAKDOWNS
+SPLIT_VARIETIES: List[Tuple[str, str]] = VARIETIES[:3] + BROILER_BREAKDOWNS
+VARIETY_NAME_PATTERN: str = "(" + "|".join(
+    re.escape(pszName) for _, pszName in SPLIT_VARIETIES
+) + ")"
 AVERAGE_WEIGHT_COLUMN_INDEX = 3
 SHIPPING_COUNT_COLUMN_INDEX = 18
 AGE_COLUMN_INDEX = 19
@@ -861,6 +870,18 @@ def aggregate_step0001(
         raise_conversion_error("STEP0001_DATA_MISSING", "step0001 did not contain data rows.")
     iYear, iMonth = objYearMonth
     pszProcessMonth: str = f"{iYear:04d}{iMonth:02d}"
+    if bVariety:
+        # Preserve the original four rows, then append the two broiler details.
+        for _, pszName in BROILER_BREAKDOWNS:
+            arrGroupNumbers = (
+                {"1", "2"} if pszName == BROILER_BREAKDOWNS[0][1] else {"4"}
+            )
+            dicRows[pszName] = [
+                (iLineNumber, arrFields)
+                for iLineNumber, arrFields in dicRows["ブロイラー"]
+                if arrFields[10].strip(" \u3000\t") in arrGroupNumbers
+            ]
+        arrCategories = STEP0002_VARIETIES
     arrOutputRows: List[str] = []
     for pszVarietyNumber, pszVarietyName in arrCategories:
         arrGroupRows = dicRows[pszVarietyName]
@@ -1400,7 +1421,7 @@ def extract_step0003_item_tsv(
     bVariety: bool = False,
 ) -> Tuple[int, int]:
     _, iFileYear, iFileMonth, _ = parse_step0002_file_name(pszInputPath, bVariety)
-    arrCategories = VARIETIES if bVariety else GROUPS
+    arrCategories = SPLIT_VARIETIES if bVariety else GROUPS
     iNumberColumnIndex, iNameColumnIndex = (15, 16) if bVariety else (10, 11)
     try:
         with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
@@ -1435,16 +1456,19 @@ def extract_step0003_item_tsv(
                 + ", Actual = "
                 + arrHeader[iColumnIndex],
             )
-    if len(arrLines) != len(arrCategories) + 1:
+    if len(arrLines) != (len(STEP0002_VARIETIES) if bVariety else len(GROUPS)) + 1:
         raise_conversion_error(
             "INVALID_STEP0002_ROW_COUNT",
             "step0002 must contain one header and "
-            + ("four" if bVariety else "three") + " data rows. Actual rows = "
+            + ("six" if bVariety else "three") + " data rows. Actual rows = "
             + str(len(arrLines)),
         )
 
     arrOutputRows: List[str] = []
-    for iGroupIndex, (pszExpectedNumber, pszExpectedName) in enumerate(arrCategories, start=1):
+    arrDataRowIndexes = [1, 2, 3, 5, 6] if bVariety else [1, 2, 3]
+    for iGroupIndex, (pszExpectedNumber, pszExpectedName) in zip(
+        arrDataRowIndexes, arrCategories
+    ):
         iLineNumber: int = iGroupIndex + 1
         arrFields: List[str] = arrLines[iGroupIndex].split("\t")
         if len(arrFields) != 64:
@@ -1803,7 +1827,7 @@ def create_step0007_variety_files(
             dicOutputRows: Dict[str, List[str]] = {
                 pszItemName: [] for pszItemName in arrOutputItems
             }
-            for objVarietyKey in VARIETIES:
+            for objVarietyKey in SPLIT_VARIETIES:
                 arrCommonFields = dicItemRows["出荷羽数"][objVarietyKey][:4]
                 for pszItemName in arrRequiredItems:
                     if dicItemRows[pszItemName][objVarietyKey][:4] != arrCommonFields:
@@ -1953,7 +1977,7 @@ def create_step0003_variety_deduction_growth_rate_files(
                 True,
             )
             arrOutputRows: List[str] = []
-            for pszVarietyNumber, pszVarietyName in VARIETIES:
+            for pszVarietyNumber, pszVarietyName in SPLIT_VARIETIES:
                 objVarietyKey = (pszVarietyNumber, pszVarietyName)
                 arrPlacementFields = dicPlacementRows[objVarietyKey]
                 arrProcessedFields = dicProcessedRows[objVarietyKey]
@@ -2064,7 +2088,7 @@ def create_step0003_variety_pre_discard_growth_rate_files(
                 True,
             )
             arrOutputRows: List[str] = []
-            for pszVarietyNumber, pszVarietyName in VARIETIES:
+            for pszVarietyNumber, pszVarietyName in SPLIT_VARIETIES:
                 objVarietyKey = (pszVarietyNumber, pszVarietyName)
                 arrPlacementFields = dicPlacementRows[objVarietyKey]
                 arrShipmentFields = dicShipmentRows[objVarietyKey]
@@ -8352,7 +8376,7 @@ def read_step0003_for_step0004(
     iExpectedMonth: int,
     bVariety: bool = False,
 ) -> Dict[Tuple[str, str], List[str]]:
-    arrCategories = VARIETIES if bVariety else GROUPS
+    arrCategories = SPLIT_VARIETIES if bVariety else GROUPS
     try:
         with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
             arrLines: List[str] = [strip_line_ending(pszLine) for pszLine in objFile]
@@ -8368,7 +8392,7 @@ def read_step0003_for_step0004(
         raise_conversion_error(
             "INVALID_STEP0003_ROW_COUNT",
             "step0003 must contain one header and "
-            + ("four" if bVariety else "three") + " data rows. Path = "
+            + ("five" if bVariety else "three") + " data rows. Path = "
             + pszInputPath
             + ", Actual rows = "
             + str(len(arrLines)),
@@ -8394,9 +8418,7 @@ def read_step0003_for_step0004(
             + " | ".join(arrHeader),
         )
 
-    dicExpectedGroups: Dict[str, str] = {
-        pszNumber: pszName for pszNumber, pszName in arrCategories
-    }
+    setExpectedGroups = set(arrCategories)
     dicRows: Dict[Tuple[str, str], List[str]] = {}
     for iLineNumber, pszLine in enumerate(arrLines[1:], start=2):
         arrFields: List[str] = pszLine.split("\t")
@@ -8421,7 +8443,14 @@ def read_step0003_for_step0004(
             )
         pszGroupNumber: str = arrFields[2].strip(" \u3000\t")
         pszGroupName: str = arrFields[3].strip(" \u3000\t")
-        if dicExpectedGroups.get(pszGroupNumber) != pszGroupName:
+        objExpectedKey = (
+            arrCategories[iLineNumber - 2] if bVariety
+            else (pszGroupNumber, pszGroupName)
+        )
+        if (
+            (pszGroupNumber, pszGroupName) not in setExpectedGroups
+            or (pszGroupNumber, pszGroupName) != objExpectedKey
+        ):
             raise_conversion_error(
                 "INVALID_STEP0003_VARIETY" if bVariety else "INVALID_STEP0003_GROUP",
                 "unexpected step0003 " + ("variety" if bVariety else "group")
@@ -8465,7 +8494,6 @@ def read_step0003_for_step0004(
             )
         dicRows[objGroupKey] = arrFields
 
-    setExpectedGroups = set(dicExpectedGroups.items())
     if set(dicRows) != setExpectedGroups:
         raise_conversion_error(
             "INVALID_STEP0003_VARIETY" if bVariety else "INVALID_STEP0003_GROUP",
@@ -8656,7 +8684,7 @@ def create_step0004_variety_files(
                     True,
                 )
 
-            for pszVarietyNumber, pszVarietyName in VARIETIES:
+            for pszVarietyNumber, pszVarietyName in SPLIT_VARIETIES:
                 objVarietyKey = (pszVarietyNumber, pszVarietyName)
                 arrCommonFields = dicItemRows[STEP0004_VARIETY_ITEMS[0][0]][
                     objVarietyKey
@@ -8845,7 +8873,7 @@ def create_step0004_variety_deduction_files(
                     True,
                 )
 
-            for pszVarietyNumber, pszVarietyName in VARIETIES:
+            for pszVarietyNumber, pszVarietyName in SPLIT_VARIETIES:
                 objVarietyKey = (pszVarietyNumber, pszVarietyName)
                 arrCommonFields = dicItemRows[
                     STEP0004_VARIETY_DEDUCTION_ITEMS[0][0]
@@ -9160,12 +9188,12 @@ def build_step0004_variety_path_map(
     setExpectedKeys = {
         (iYear, iMonth, pszVarietyNumber, pszVarietyName)
         for iYear, iMonth in arrStep0004YearMonths
-        for pszVarietyNumber, pszVarietyName in VARIETIES
+        for pszVarietyNumber, pszVarietyName in SPLIT_VARIETIES
     }
     dicPaths: Dict[Tuple[int, int, str, str], str] = {}
     for pszPath in arrStep0004Paths:
         objMatch = re.fullmatch(
-            r".+_step0004_品種別_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+            r".+_step0004_品種別_" + VARIETY_NAME_PATTERN + r"_"
             r"(\d{4})_(\d{2})(?:_\d+)?\.tsv",
             os.path.basename(pszPath),
         )
@@ -9177,7 +9205,7 @@ def build_step0004_variety_path_map(
         pszVarietyName = objMatch.group(1)
         iYear, iMonth = parse_year_month(objMatch.group(2), objMatch.group(3), 1)
         dicVarietyNumbers = {
-            pszName: pszNumber for pszNumber, pszName in VARIETIES
+            pszName: pszNumber for pszNumber, pszName in SPLIT_VARIETIES
         }
         objKey = (
             iYear,
@@ -9297,7 +9325,7 @@ def create_step0005_variety_files(
                     if iTargetYear == iYear
                 }
             )
-            for pszVarietyNumber, pszVarietyName in VARIETIES:
+            for pszVarietyNumber, pszVarietyName in SPLIT_VARIETIES:
                 pszCommonHeader = ""
                 arrRows: List[str] = []
                 for iMonth in arrMonths:
@@ -9385,16 +9413,15 @@ def build_step0004_variety_deduction_path_map(
     setExpectedKeys = {
         (iYear, iMonth, pszVarietyNumber, pszVarietyName)
         for iYear, iMonth in arrStep0004YearMonths
-        for pszVarietyNumber, pszVarietyName in VARIETIES
+        for pszVarietyNumber, pszVarietyName in SPLIT_VARIETIES
     }
     dicVarietyNumbers = {
-        pszName: pszNumber for pszNumber, pszName in VARIETIES
+        pszName: pszNumber for pszNumber, pszName in SPLIT_VARIETIES
     }
     dicPaths: Dict[Tuple[int, int, str, str], str] = {}
     for pszPath in arrStep0004Paths:
         objMatch = re.fullmatch(
-            r".+_step0004_品種別_控除廃棄_"
-            r"(阿波尾鶏|赤どり|地養鳥|ブロイラー)_(\d{4})_(\d{2})"
+            r".+_step0004_品種別_控除廃棄_" + VARIETY_NAME_PATTERN + r"_(\d{4})_(\d{2})"
             r"(?:_\d+)?\.tsv",
             os.path.basename(pszPath),
         )
@@ -9528,7 +9555,7 @@ def create_step0005_variety_deduction_files(
                     if iTargetYear == iYear
                 }
             )
-            for pszVarietyNumber, pszVarietyName in VARIETIES:
+            for pszVarietyNumber, pszVarietyName in SPLIT_VARIETIES:
                 pszCommonHeader = ""
                 arrRows: List[str] = []
                 for iMonth in arrMonths:
@@ -9819,7 +9846,7 @@ def read_step0005_variety_for_step0006(
 ) -> List[List[str]]:
     """品種別step0005年間TSVを検証して読み込みます。"""
     objFileNameMatch = re.search(
-        r"_step0005_品種別_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+        r"_step0005_品種別_" + VARIETY_NAME_PATTERN + r"_"
         r"(\d{4})_年間(?:_\d+)?\.tsv$",
         os.path.basename(pszInputPath),
     )
@@ -9831,7 +9858,7 @@ def read_step0005_variety_for_step0006(
     pszExpectedVarietyName = objFileNameMatch.group(1)
     iExpectedYear = int(objFileNameMatch.group(2))
     dicVarietyNumbers = {
-        pszName: pszNumber for pszNumber, pszName in VARIETIES
+        pszName: pszNumber for pszNumber, pszName in SPLIT_VARIETIES
     }
     pszExpectedVarietyNumber = dicVarietyNumbers[pszExpectedVarietyName]
 
@@ -9930,7 +9957,7 @@ def create_step0006_variety_files(
     dicInputs: Dict[Tuple[int, str], str] = {}
     for pszPath in arrStep0005VarietyPaths:
         objMatch = re.search(
-            r"_step0005_品種別_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+            r"_step0005_品種別_" + VARIETY_NAME_PATTERN + r"_"
             r"(\d{4})_年間(?:_\d+)?\.tsv$",
             os.path.basename(pszPath),
         )
@@ -9951,12 +9978,12 @@ def create_step0006_variety_files(
     setExpectedKeys = {
         (iYear, pszVarietyName)
         for iYear in setYears
-        for _, pszVarietyName in VARIETIES
+        for _, pszVarietyName in SPLIT_VARIETIES
     }
     if set(dicInputs) != setExpectedKeys:
         raise_conversion_error(
             "INVALID_STEP0005_VARIETY_PATH_COUNT",
-            "variety step0005 paths must contain all four varieties for each year. "
+            "variety step0005 paths must contain all five varieties for each year. "
             "Expected = " + str(len(setExpectedKeys))
             + ", Actual = " + str(len(dicInputs)),
         )
@@ -9964,7 +9991,7 @@ def create_step0006_variety_files(
     arrCreatedPaths: List[str] = []
     try:
         for iYear in sorted(setYears):
-            for _, pszVarietyName in VARIETIES:
+            for _, pszVarietyName in SPLIT_VARIETIES:
                 pszInputPath = dicInputs[(iYear, pszVarietyName)]
                 arrInputRows = read_step0005_variety_for_step0006(pszInputPath)
                 arrTransposedRows = transpose_tsv_rows(arrInputRows)
@@ -9994,7 +10021,7 @@ def read_step0005_variety_deduction_for_step0006(
 ) -> List[List[str]]:
     """控除廃棄版の品種別step0005年間TSVを検証して読み込みます。"""
     objFileNameMatch = re.search(
-        r"_step0005_品種別_控除廃棄_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+        r"_step0005_品種別_控除廃棄_" + VARIETY_NAME_PATTERN + r"_"
         r"(\d{4})_年間(?:_\d+)?\.tsv$",
         os.path.basename(pszInputPath),
     )
@@ -10007,7 +10034,7 @@ def read_step0005_variety_deduction_for_step0006(
     pszExpectedVarietyName = objFileNameMatch.group(1)
     iExpectedYear = int(objFileNameMatch.group(2))
     dicVarietyNumbers = {
-        pszName: pszNumber for pszNumber, pszName in VARIETIES
+        pszName: pszNumber for pszNumber, pszName in SPLIT_VARIETIES
     }
     pszExpectedVarietyNumber = dicVarietyNumbers[pszExpectedVarietyName]
 
@@ -10107,7 +10134,7 @@ def create_step0006_variety_deduction_files(
     dicInputs: Dict[Tuple[int, str], str] = {}
     for pszPath in arrStep0005VarietyDeductionPaths:
         objMatch = re.search(
-            r"_step0005_品種別_控除廃棄_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+            r"_step0005_品種別_控除廃棄_" + VARIETY_NAME_PATTERN + r"_"
             r"(\d{4})_年間(?:_\d+)?\.tsv$",
             os.path.basename(pszPath),
         )
@@ -10130,12 +10157,12 @@ def create_step0006_variety_deduction_files(
     setExpectedKeys = {
         (iYear, pszVarietyName)
         for iYear in setYears
-        for _, pszVarietyName in VARIETIES
+        for _, pszVarietyName in SPLIT_VARIETIES
     }
     if set(dicInputs) != setExpectedKeys:
         raise_conversion_error(
             "INVALID_STEP0005_VARIETY_DEDUCTION_PATH_COUNT",
-            "variety deduction step0005 paths must contain all four "
+            "variety deduction step0005 paths must contain all five "
             "varieties for each year. Expected = " + str(len(setExpectedKeys))
             + ", Actual = " + str(len(dicInputs)),
         )
@@ -10143,7 +10170,7 @@ def create_step0006_variety_deduction_files(
     arrCreatedPaths: List[str] = []
     try:
         for iYear in sorted(setYears):
-            for _, pszVarietyName in VARIETIES:
+            for _, pszVarietyName in SPLIT_VARIETIES:
                 pszInputPath = dicInputs[(iYear, pszVarietyName)]
                 arrInputRows = read_step0005_variety_deduction_for_step0006(
                     pszInputPath
@@ -10486,7 +10513,7 @@ def read_step0006_variety_annual_for_step0007(
     pszInputPath: str, iExpectedYear: int, pszExpectedVarietyName: str
 ) -> Dict[str, List[str]]:
     objMatch = re.search(
-        r"_step0006_品種別_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+        r"_step0006_品種別_" + VARIETY_NAME_PATTERN + r"_"
         r"(\d{4})_年間(?:_\d{2})?\.tsv$",
         os.path.basename(pszInputPath),
     )
@@ -10540,7 +10567,7 @@ def read_step0006_variety_annual_for_step0007(
         arrRow[0].strip(" \u3000\t"): arrRow[1:] for arrRow in arrRows
     }
     dicVarietyNumbers = {
-        pszName: pszNumber for pszNumber, pszName in VARIETIES
+        pszName: pszNumber for pszNumber, pszName in SPLIT_VARIETIES
     }
     pszExpectedVarietyNumber = dicVarietyNumbers[pszExpectedVarietyName]
     arrMonths: List[int] = []
@@ -10629,7 +10656,7 @@ def create_step0007_variety_annual_files(
     dicPaths: Dict[Tuple[int, str], str] = {}
     for pszPath in arrStep0006VarietyPaths:
         objMatch = re.search(
-            r"_step0006_品種別_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+            r"_step0006_品種別_" + VARIETY_NAME_PATTERN + r"_"
             r"(\d{4})_年間(?:_\d{2})?\.tsv$",
             os.path.basename(pszPath),
         )
@@ -10650,12 +10677,12 @@ def create_step0007_variety_annual_files(
     setExpectedKeys = {
         (iYear, pszVarietyName)
         for iYear in arrYears
-        for _, pszVarietyName in VARIETIES
+        for _, pszVarietyName in SPLIT_VARIETIES
     }
     if set(dicPaths) != setExpectedKeys:
         raise_conversion_error(
             "INVALID_STEP0006_VARIETY_PATH_COUNT",
-            "step0006 variety paths must contain all four varieties for each "
+            "step0006 variety paths must contain all five varieties for each "
             "year. Expected = " + str(len(setExpectedKeys))
             + ", Actual = " + str(len(dicPaths)),
         )
@@ -10664,15 +10691,15 @@ def create_step0007_variety_annual_files(
     try:
         for iYear in arrYears:
             dicVarietyRows: Dict[str, Dict[str, List[str]]] = {}
-            for _, pszVarietyName in VARIETIES:
+            for _, pszVarietyName in SPLIT_VARIETIES:
                 pszInputPath = dicPaths[(iYear, pszVarietyName)]
                 dicVarietyRows[pszVarietyName] = (
                     read_step0006_variety_annual_for_step0007(
                         pszInputPath, iYear, pszVarietyName
                     )
                 )
-            arrReferenceMonths = dicVarietyRows[VARIETIES[0][1]]["月"]
-            for _, pszVarietyName in VARIETIES[1:]:
+            arrReferenceMonths = dicVarietyRows[SPLIT_VARIETIES[0][1]]["月"]
+            for _, pszVarietyName in SPLIT_VARIETIES[1:]:
                 if dicVarietyRows[pszVarietyName]["月"] != arrReferenceMonths:
                     raise_conversion_error(
                         "STEP0006_VARIETY_MONTH_MISMATCH",
@@ -10686,7 +10713,7 @@ def create_step0007_variety_annual_files(
                 "\t".join(["", "年"] + [f"{iYear:04d}"] * iMonthCount),
                 "\t".join(["", "月"] + arrReferenceMonths),
             ]
-            for _, pszVarietyName in VARIETIES:
+            for _, pszVarietyName in SPLIT_VARIETIES:
                 arrRows.extend(
                     create_step0007_variety_annual_rows(
                         pszVarietyName, dicVarietyRows[pszVarietyName]
@@ -10765,7 +10792,7 @@ def read_step0006_variety_deduction_annual_for_step0007(
     pszInputPath: str, iExpectedYear: int, pszExpectedVarietyName: str
 ) -> Dict[str, List[str]]:
     objMatch = re.search(
-        r"_step0006_品種別_控除廃棄_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+        r"_step0006_品種別_控除廃棄_" + VARIETY_NAME_PATTERN + r"_"
         r"(\d{4})_年間(?:_\d{2})?\.tsv$",
         os.path.basename(pszInputPath),
     )
@@ -10822,7 +10849,7 @@ def read_step0006_variety_deduction_annual_for_step0007(
         arrRow[0].strip(" \u3000\t"): arrRow[1:] for arrRow in arrRows
     }
     dicVarietyNumbers = {
-        pszName: pszNumber for pszNumber, pszName in VARIETIES
+        pszName: pszNumber for pszNumber, pszName in SPLIT_VARIETIES
     }
     pszExpectedVarietyNumber = dicVarietyNumbers[pszExpectedVarietyName]
     arrMonths: List[int] = []
@@ -10914,7 +10941,7 @@ def create_step0007_variety_deduction_annual_files(
     dicPaths: Dict[Tuple[int, str], str] = {}
     for pszPath in arrStep0006VarietyDeductionPaths:
         objMatch = re.search(
-            r"_step0006_品種別_控除廃棄_(阿波尾鶏|赤どり|地養鳥|ブロイラー)_"
+            r"_step0006_品種別_控除廃棄_" + VARIETY_NAME_PATTERN + r"_"
             r"(\d{4})_年間(?:_\d{2})?\.tsv$",
             os.path.basename(pszPath),
         )
@@ -10936,12 +10963,12 @@ def create_step0007_variety_deduction_annual_files(
     setExpectedKeys = {
         (iYear, pszVarietyName)
         for iYear in arrYears
-        for _, pszVarietyName in VARIETIES
+        for _, pszVarietyName in SPLIT_VARIETIES
     }
     if set(dicPaths) != setExpectedKeys:
         raise_conversion_error(
             "INVALID_STEP0006_VARIETY_DEDUCTION_PATH_COUNT",
-            "variety deduction step0006 paths must contain all four varieties "
+            "variety deduction step0006 paths must contain all five varieties "
             "for each year. Expected = " + str(len(setExpectedKeys))
             + ", Actual = " + str(len(dicPaths)),
         )
@@ -10950,15 +10977,15 @@ def create_step0007_variety_deduction_annual_files(
     try:
         for iYear in arrYears:
             dicVarietyRows: Dict[str, Dict[str, List[str]]] = {}
-            for _, pszVarietyName in VARIETIES:
+            for _, pszVarietyName in SPLIT_VARIETIES:
                 pszInputPath = dicPaths[(iYear, pszVarietyName)]
                 dicVarietyRows[pszVarietyName] = (
                     read_step0006_variety_deduction_annual_for_step0007(
                         pszInputPath, iYear, pszVarietyName
                     )
                 )
-            arrReferenceMonths = dicVarietyRows[VARIETIES[0][1]]["月"]
-            for _, pszVarietyName in VARIETIES[1:]:
+            arrReferenceMonths = dicVarietyRows[SPLIT_VARIETIES[0][1]]["月"]
+            for _, pszVarietyName in SPLIT_VARIETIES[1:]:
                 if dicVarietyRows[pszVarietyName]["月"] != arrReferenceMonths:
                     raise_conversion_error(
                         "STEP0006_VARIETY_DEDUCTION_MONTH_MISMATCH",
@@ -10972,7 +10999,7 @@ def create_step0007_variety_deduction_annual_files(
                 "\t".join(["", "年"] + [f"{iYear:04d}"] * iMonthCount),
                 "\t".join(["", "月"] + arrReferenceMonths),
             ]
-            for _, pszVarietyName in VARIETIES:
+            for _, pszVarietyName in SPLIT_VARIETIES:
                 arrRows.extend(
                     create_step0007_variety_deduction_annual_rows(
                         pszVarietyName, dicVarietyRows[pszVarietyName]
@@ -11590,7 +11617,7 @@ def read_step0007_variety_annual_for_step0008(
         )
 
     arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
-    for _, pszVarietyName in VARIETIES:
+    for _, pszVarietyName in SPLIT_VARIETIES:
         arrExpectedStructure.extend(
             (pszVarietyName if iItemIndex == 0 else "", pszItemName)
             for iItemIndex, (pszItemName, _, _) in enumerate(
@@ -11600,7 +11627,7 @@ def read_step0007_variety_annual_for_step0008(
     if len(arrRows) != len(arrExpectedStructure):
         raise_conversion_error(
             "INVALID_STEP0007_VARIETY_ROW_COUNT",
-            "variety step0007 must contain 26 rows. Path = " + pszInputPath,
+            "variety step0007 must contain 32 rows. Path = " + pszInputPath,
         )
     iColumnCount = len(arrRows[0])
     if iColumnCount < 3 or any(
@@ -11642,7 +11669,7 @@ def read_step0007_variety_annual_for_step0008(
                 + pszInputPath,
             )
         arrMonths.append(iMonth)
-        for iVarietyIndex, (_, pszVarietyName) in enumerate(VARIETIES):
+        for iVarietyIndex, (_, pszVarietyName) in enumerate(SPLIT_VARIETIES):
             iVarietyStart = 2 + iVarietyIndex * len(STEP0004_VARIETY_ITEMS)
             for iItemOffset, (pszItemName, _, bAllowBlank) in enumerate(
                 STEP0004_VARIETY_ITEMS
@@ -11691,7 +11718,7 @@ def create_step0008_variety_annual_files(
             pszOutputPath = create_step0008_output_path(pszStep0007Path)
             arrOutputRows = [list(arrInputRows[0]), list(arrInputRows[1])]
             for iVarietyIndex, (pszVarietyNumber, pszVarietyName) in enumerate(
-                VARIETIES
+                SPLIT_VARIETIES
             ):
                 iVarietyStart = 2 + iVarietyIndex * len(STEP0004_VARIETY_ITEMS)
                 arrVarietyRows = [
@@ -11762,7 +11789,7 @@ def read_step0008_variety_annual_for_step0009(
 
     arrExpectedItems = STEP0008_VARIETY_ITEM_NAMES
     arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
-    for _, pszVarietyName in VARIETIES:
+    for _, pszVarietyName in SPLIT_VARIETIES:
         arrExpectedStructure.extend(
             (pszVarietyName if iItemIndex == 0 else "", pszItemName)
             for iItemIndex, pszItemName in enumerate(arrExpectedItems)
@@ -11770,7 +11797,7 @@ def read_step0008_variety_annual_for_step0009(
     if len(arrRows) != len(arrExpectedStructure):
         raise_conversion_error(
             "INVALID_STEP0008_VARIETY_ROW_COUNT",
-            "variety step0008 must contain 26 rows. Path = " + pszInputPath,
+            "variety step0008 must contain 32 rows. Path = " + pszInputPath,
         )
     iColumnCount = len(arrRows[0])
     if iColumnCount < 3 or any(
@@ -11812,7 +11839,7 @@ def read_step0008_variety_annual_for_step0009(
                 + pszInputPath,
             )
         arrMonths.append(iMonth)
-        for iVarietyIndex, (_, pszVarietyName) in enumerate(VARIETIES):
+        for iVarietyIndex, (_, pszVarietyName) in enumerate(SPLIT_VARIETIES):
             iVarietyStart = 2 + iVarietyIndex * len(arrExpectedItems)
             for iItemOffset, pszItemName in enumerate(arrExpectedItems):
                 iRowIndex = iVarietyStart + iItemOffset
@@ -11871,7 +11898,7 @@ def read_step0007_variety_deduction_annual_for_step0008(
         )
 
     arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
-    for _, pszVarietyName in VARIETIES:
+    for _, pszVarietyName in SPLIT_VARIETIES:
         arrExpectedStructure.extend(
             (pszVarietyName if iItemIndex == 0 else "", pszItemName)
             for iItemIndex, (pszItemName, _, _) in enumerate(
@@ -11881,7 +11908,7 @@ def read_step0007_variety_deduction_annual_for_step0008(
     if len(arrRows) != len(arrExpectedStructure):
         raise_conversion_error(
             "INVALID_STEP0007_VARIETY_DEDUCTION_ROW_COUNT",
-            "variety deduction step0007 must contain 26 rows. Path = "
+            "variety deduction step0007 must contain 32 rows. Path = "
             + pszInputPath,
         )
     iColumnCount = len(arrRows[0])
@@ -11925,7 +11952,7 @@ def read_step0007_variety_deduction_annual_for_step0008(
                 "ascending. Path = " + pszInputPath,
             )
         arrMonths.append(iMonth)
-        for iVarietyIndex, (_, pszVarietyName) in enumerate(VARIETIES):
+        for iVarietyIndex, (_, pszVarietyName) in enumerate(SPLIT_VARIETIES):
             iVarietyStart = (
                 2 + iVarietyIndex * len(STEP0004_VARIETY_DEDUCTION_ITEMS)
             )
@@ -11978,7 +12005,7 @@ def create_step0008_variety_deduction_annual_files(
             pszOutputPath = create_step0008_output_path(pszStep0007Path)
             arrOutputRows = [list(arrInputRows[0]), list(arrInputRows[1])]
             for iVarietyIndex, (pszVarietyNumber, pszVarietyName) in enumerate(
-                VARIETIES
+                SPLIT_VARIETIES
             ):
                 iVarietyStart = (
                     2 + iVarietyIndex * len(STEP0004_VARIETY_DEDUCTION_ITEMS)
@@ -12295,7 +12322,7 @@ def create_step0009_rows(arrInputRows: List[List[str]]) -> List[List[str]]:
 def create_step0009_variety_annual_rows(
     arrInputRows: List[List[str]],
 ) -> List[List[str]]:
-    """品種別step0008に4品種合計行を加えてstep0009行を作成します。"""
+    """品種別step0008に5区分合計行を加えてstep0009行を作成します。"""
     iItemsPerVariety = len(STEP0008_VARIETY_ITEM_NAMES)
     arrItemNames = STEP0008_VARIETY_ITEM_NAMES
     arrOutputRows: List[List[str]] = [
@@ -12319,7 +12346,7 @@ def create_step0009_variety_annual_rows(
                             2 + iVarietyIndex * iItemsPerVariety + iItemIndex
                         ][iColumnIndex].strip(" \u3000\t")
                     )
-                    for iVarietyIndex in range(len(VARIETIES))
+                    for iVarietyIndex in range(len(SPLIT_VARIETIES))
                 ),
                 Decimal("0"),
             )
@@ -12333,7 +12360,7 @@ def create_step0009_variety_annual_rows(
         )
         objAgeWeightedTotal = Decimal("0")
         objAgeWeightTotal = Decimal("0")
-        for iVarietyIndex in range(len(VARIETIES)):
+        for iVarietyIndex in range(len(SPLIT_VARIETIES)):
             iVarietyStart = 2 + iVarietyIndex * iItemsPerVariety
             pszAge = arrInputRows[iVarietyStart + 4][iColumnIndex].strip(
                 " \u3000\t"
@@ -12688,7 +12715,7 @@ def read_step0008_variety_deduction_for_step0009(
 
     arrItemNames: List[str] = STEP0008_VARIETY_DEDUCTION_ITEM_NAMES
     arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
-    for _, pszVarietyName in VARIETIES:
+    for _, pszVarietyName in SPLIT_VARIETIES:
         for iItemIndex, pszItemName in enumerate(arrItemNames):
             arrExpectedStructure.append(
                 (pszVarietyName if iItemIndex == 0 else "", pszItemName)
@@ -12696,7 +12723,7 @@ def read_step0008_variety_deduction_for_step0009(
     if len(arrRows) != len(arrExpectedStructure):
         raise_conversion_error(
             "INVALID_STEP0008_VARIETY_DEDUCTION_ROW_COUNT",
-            "variety deduction step0008 must contain 26 rows. Path = "
+            "variety deduction step0008 must contain 32 rows. Path = "
             + pszInputPath,
         )
     iColumnCount: int = len(arrRows[0])
@@ -12764,7 +12791,7 @@ def read_step0008_variety_deduction_for_step0009(
 def create_step0009_variety_deduction_annual_rows(
     arrInputRows: List[List[str]],
 ) -> List[List[str]]:
-    """控除廃棄版step0008に4品種合計行を加えてstep0009を作成します。"""
+    """控除廃棄版step0008に5区分合計行を加えてstep0009を作成します。"""
     iItemsPerVariety: int = len(STEP0008_VARIETY_DEDUCTION_ITEM_NAMES)
     arrItemNames: List[str] = STEP0008_VARIETY_DEDUCTION_ITEM_NAMES
     arrOutputRows: List[List[str]] = [
@@ -12788,7 +12815,7 @@ def create_step0009_variety_deduction_annual_rows(
                             2 + iVarietyIndex * iItemsPerVariety + iItemIndex
                         ][iColumnIndex].strip(" \u3000\t")
                     )
-                    for iVarietyIndex in range(len(VARIETIES))
+                    for iVarietyIndex in range(len(SPLIT_VARIETIES))
                 ),
                 Decimal("0"),
             )
@@ -12802,7 +12829,7 @@ def create_step0009_variety_deduction_annual_rows(
         )
         objAgeWeightedTotal: Decimal = Decimal("0")
         objAgeWeightTotal: Decimal = Decimal("0")
-        for iVarietyIndex in range(len(VARIETIES)):
+        for iVarietyIndex in range(len(SPLIT_VARIETIES)):
             iVarietyStart: int = 2 + iVarietyIndex * iItemsPerVariety
             pszAge: str = arrInputRows[iVarietyStart + 4][iColumnIndex].strip(
                 " \u3000\t"
@@ -12896,7 +12923,7 @@ def read_step0009_variety_for_excel(
         )
     arrItemNames: List[str] = STEP0008_VARIETY_ITEM_NAMES
     arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
-    for pszVarietyName in [pszName for _, pszName in VARIETIES] + ["合計"]:
+    for pszVarietyName in [pszName for _, pszName in SPLIT_VARIETIES] + ["合計"]:
         for iItemIndex, pszItemName in enumerate(arrItemNames):
             arrExpectedStructure.append(
                 (pszVarietyName if iItemIndex == 0 else "", pszItemName)
@@ -12904,7 +12931,7 @@ def read_step0009_variety_for_excel(
     if len(arrRows) != len(arrExpectedStructure):
         raise_conversion_error(
             "INVALID_STEP0009_VARIETY_ROW_COUNT",
-            "variety step0009 must contain 32 rows. Path = " + pszInputPath,
+            "variety step0009 must contain 38 rows. Path = " + pszInputPath,
         )
     iColumnCount: int = len(arrRows[0])
     if iColumnCount < 3 or any(len(arrRow) != iColumnCount for arrRow in arrRows):
@@ -13131,7 +13158,7 @@ def read_step0009_variety_deduction_for_excel(
         )
     arrItemNames: List[str] = STEP0008_VARIETY_DEDUCTION_ITEM_NAMES
     arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
-    for pszVarietyName in [pszName for _, pszName in VARIETIES] + ["合計"]:
+    for pszVarietyName in [pszName for _, pszName in SPLIT_VARIETIES] + ["合計"]:
         for iItemIndex, pszItemName in enumerate(arrItemNames):
             arrExpectedStructure.append(
                 (pszVarietyName if iItemIndex == 0 else "", pszItemName)
@@ -13139,7 +13166,7 @@ def read_step0009_variety_deduction_for_excel(
     if len(arrRows) != len(arrExpectedStructure):
         raise_conversion_error(
             "INVALID_STEP0009_VARIETY_DEDUCTION_ROW_COUNT",
-            "variety deduction step0009 must contain 32 rows. Path = "
+            "variety deduction step0009 must contain 38 rows. Path = "
             + pszInputPath,
         )
     iColumnCount: int = len(arrRows[0])
@@ -13491,7 +13518,7 @@ def create_step0010_variety_rows(
     arrOutputRows: List[List[str]] = [list(arrRow) for arrRow in arrInputRows]
     arrOutputRows[0].append("")
     arrOutputRows[1].append("合計")
-    for iVarietyIndex in range(len(VARIETIES) + 1):
+    for iVarietyIndex in range(len(SPLIT_VARIETIES) + 1):
         iVarietyStart: int = 2 + iVarietyIndex * iItemsPerVariety
         arrTotals: List[Decimal] = [
             sum(
@@ -13627,7 +13654,7 @@ def read_step0010_variety_for_excel(
         )
     arrItemNames: List[str] = STEP0008_VARIETY_ITEM_NAMES
     arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
-    for pszVarietyName in [pszName for _, pszName in VARIETIES] + ["合計"]:
+    for pszVarietyName in [pszName for _, pszName in SPLIT_VARIETIES] + ["合計"]:
         for iItemIndex, pszItemName in enumerate(arrItemNames):
             arrExpectedStructure.append(
                 (pszVarietyName if iItemIndex == 0 else "", pszItemName)
@@ -13635,7 +13662,7 @@ def read_step0010_variety_for_excel(
     if len(arrRows) != len(arrExpectedStructure):
         raise_conversion_error(
             "INVALID_STEP0010_VARIETY_ROW_COUNT",
-            "variety step0010 must contain 32 rows. Path = " + pszInputPath,
+            "variety step0010 must contain 38 rows. Path = " + pszInputPath,
         )
     if any(len(arrRow) != 15 for arrRow in arrRows):
         raise_conversion_error(
@@ -13781,7 +13808,10 @@ def write_step0010_variety_excel(
             objWorkbook = Workbook()
             objWorksheet = objWorkbook.active
             objWorksheet.title = "品種別"
+            pszCurrentVariety: str = ""
             for iRowIndex, arrFields in enumerate(arrRows, start=1):
+                if arrFields[0].strip(" \u3000\t"):
+                    pszCurrentVariety = arrFields[0].strip(" \u3000\t")
                 pszRowType: str = arrFields[1].strip(" \u3000\t")
                 for iColumnIndex, pszValue in enumerate(arrFields, start=1):
                     objCell = objWorksheet.cell(iRowIndex, iColumnIndex)
@@ -13789,6 +13819,11 @@ def write_step0010_variety_excel(
                         iRowIndex == 2 and iColumnIndex == 15
                     ):
                         objCell.value = pszValue if pszValue != "" else None
+                        continue
+                    if (
+                        pszCurrentVariety == BROILER_BREAKDOWNS[1][1]
+                        and pszRowType == "飼育日数平均"
+                    ):
                         continue
                     pszNormalizedValue: str = pszValue.strip(" \u3000\t")
                     if pszNormalizedValue == "":
@@ -13922,7 +13957,7 @@ def create_step0010_variety_deduction_rows(
     arrOutputRows: List[List[str]] = [list(arrRow) for arrRow in arrInputRows]
     arrOutputRows[0].append("")
     arrOutputRows[1].append("合計")
-    for iVarietyIndex in range(len(VARIETIES) + 1):
+    for iVarietyIndex in range(len(SPLIT_VARIETIES) + 1):
         iVarietyStart: int = 2 + iVarietyIndex * iItemsPerVariety
         arrTotals: List[Decimal] = [
             sum(
@@ -14067,7 +14102,7 @@ def read_step0010_variety_deduction_for_excel(
         )
     arrItemNames: List[str] = STEP0008_VARIETY_DEDUCTION_ITEM_NAMES
     arrExpectedStructure: List[Tuple[str, str]] = [("", "年"), ("", "月")]
-    for pszVarietyName in [pszName for _, pszName in VARIETIES] + ["合計"]:
+    for pszVarietyName in [pszName for _, pszName in SPLIT_VARIETIES] + ["合計"]:
         for iItemIndex, pszItemName in enumerate(arrItemNames):
             arrExpectedStructure.append(
                 (pszVarietyName if iItemIndex == 0 else "", pszItemName)
@@ -14075,7 +14110,7 @@ def read_step0010_variety_deduction_for_excel(
     if len(arrRows) != len(arrExpectedStructure):
         raise_conversion_error(
             "INVALID_STEP0010_VARIETY_DEDUCTION_ROW_COUNT",
-            "variety deduction step0010 must contain 32 rows. Path = "
+            "variety deduction step0010 must contain 38 rows. Path = "
             + pszInputPath,
         )
     if any(len(arrRow) != 15 for arrRow in arrRows):
@@ -14231,7 +14266,10 @@ def write_step0010_variety_deduction_excel(
             objWorkbook = Workbook()
             objWorksheet = objWorkbook.active
             objWorksheet.title = "品種別"
+            pszCurrentVariety: str = ""
             for iRowIndex, arrFields in enumerate(arrRows, start=1):
+                if arrFields[0].strip(" \u3000\t"):
+                    pszCurrentVariety = arrFields[0].strip(" \u3000\t")
                 pszRowType: str = arrFields[1].strip(" \u3000\t")
                 for iColumnIndex, pszValue in enumerate(arrFields, start=1):
                     objCell = objWorksheet.cell(iRowIndex, iColumnIndex)
@@ -14239,6 +14277,11 @@ def write_step0010_variety_deduction_excel(
                         iRowIndex == 2 and iColumnIndex == 15
                     ):
                         objCell.value = pszValue if pszValue != "" else None
+                        continue
+                    if (
+                        pszCurrentVariety == BROILER_BREAKDOWNS[1][1]
+                        and pszRowType == "飼育日数平均"
+                    ):
                         continue
                     pszNormalizedValue: str = pszValue.strip(" \u3000\t")
                     if pszNormalizedValue == "":
@@ -15325,7 +15368,7 @@ def main() -> int:
     print("step0002品種別ファイル数: " + str(len(arrVarietyTsvPaths)))
     for pszPath in arrVarietyTsvPaths:
         print("step0002品種別ファイル: " + pszPath)
-    print("品種集計順: 阿波尾鶏、赤どり、地養鳥、ブロイラー")
+    print("品種集計順: 阿波尾鶏、赤どり、地養鳥、ブロイラー、ブロイラー（貞光分）、ブロイラー(外部購入)")
     print("step0002グループ別ファイル数: " + str(len(arrAggregatedTsvPaths)))
     print("step0002総計ファイル数: " + str(len(arrTotalTsvPaths)))
     for pszPath in arrTotalTsvPaths:
