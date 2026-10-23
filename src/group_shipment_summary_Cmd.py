@@ -7989,6 +7989,138 @@ def create_step0012_discard_summary_files(
         raise
 
 
+def create_step0012_discard_summary_excel_files(
+    arrStep0012DiscardSummaryPaths: List[str],
+) -> List[str]:
+    """step0012総計廃棄データ一覧表TSVから同名のExcelファイルを作成します。"""
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszTsvPath in arrStep0012DiscardSummaryPaths:
+            try:
+                with open(pszTsvPath, "r", encoding="utf-8", newline="") as objFile:
+                    arrRows = [
+                        strip_line_ending(pszLine).split("\t")
+                        for pszLine in objFile
+                    ]
+            except Exception as objException:
+                raise_conversion_error(
+                    "STEP0012_DISCARD_SUMMARY_EXCEL_READ_FAILED",
+                    "failed to read step0012 discard summary TSV. Path = "
+                    + pszTsvPath + "; Detail = " + str(objException),
+                )
+            if (
+                len(arrRows) < 3
+                or any(len(arrRow) != 26 for arrRow in arrRows)
+                or arrRows[1][25].strip(" \u3000\t") != "前年同月比(羽数)"
+            ):
+                raise_conversion_error(
+                    "INVALID_STEP0012_DISCARD_SUMMARY_EXCEL_INPUT",
+                    "step0012 discard summary TSV must contain 26 columns "
+                    "and the expected second header row. Path = " + pszTsvPath,
+                )
+
+            pszOutputPath = os.path.splitext(pszTsvPath)[0] + ".xlsx"
+            pszTemporaryPath = ""
+            bOutputReserved = False
+            objWorkbook: Optional[Workbook] = None
+            try:
+                try:
+                    iFileDescriptor = os.open(
+                        pszOutputPath, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                    )
+                    os.close(iFileDescriptor)
+                    bOutputReserved = True
+                except FileExistsError:
+                    raise_conversion_error(
+                        "STEP0012_DISCARD_SUMMARY_EXCEL_CREATE_FAILED",
+                        "step0012 discard summary Excel already exists. Path = "
+                        + pszOutputPath,
+                    )
+                iTemporaryFileDescriptor, pszTemporaryPath = tempfile.mkstemp(
+                    prefix="group_shipment_summary_step0012_discard_",
+                    suffix=".xlsx",
+                    dir=os.path.dirname(pszOutputPath),
+                )
+                os.close(iTemporaryFileDescriptor)
+                objWorkbook = Workbook()
+                objWorksheet = objWorkbook.active
+                objWorksheet.title = "総計"
+                for iRowIndex, arrFields in enumerate(arrRows, start=1):
+                    pszUnit = arrFields[4].strip(" \u3000\t") if iRowIndex >= 3 else ""
+                    for iColumnIndex, pszValue in enumerate(arrFields, start=1):
+                        objCell = objWorksheet.cell(iRowIndex, iColumnIndex)
+                        pszNormalizedValue = pszValue.strip(" \u3000\t")
+                        if pszNormalizedValue == "":
+                            objCell.value = None
+                            continue
+                        if iRowIndex <= 2 or pszNormalizedValue == "－" or "%" in pszNormalizedValue:
+                            objCell.value = pszNormalizedValue
+                            continue
+                        try:
+                            objValue = Decimal(pszNormalizedValue.replace(",", ""))
+                        except InvalidOperation:
+                            objCell.value = pszNormalizedValue
+                            continue
+                        objCell.value = (
+                            int(objValue)
+                            if objValue == objValue.to_integral_value()
+                            else float(objValue)
+                        )
+                        if iColumnIndex == 1:
+                            objCell.number_format = "0"
+                        elif iColumnIndex == 2:
+                            objCell.number_format = "00"
+                        elif iColumnIndex == 3 or pszUnit == "羽数":
+                            objCell.number_format = "#,##0"
+                        elif pszUnit == "重量" or iColumnIndex in {4, 25}:
+                            iDecimalPlaces = max(
+                                0, -objValue.as_tuple().exponent
+                            )
+                            objCell.number_format = (
+                                "#,##0." + "0" * iDecimalPlaces
+                                if iDecimalPlaces else "#,##0"
+                            )
+                        else:
+                            objCell.number_format = "0.#####"
+                objWorkbook.save(pszTemporaryPath)
+                objWorkbook.close()
+                objWorkbook = None
+                os.replace(pszTemporaryPath, pszOutputPath)
+                pszTemporaryPath = ""
+                bOutputReserved = False
+            except ConversionError:
+                raise
+            except Exception as objException:
+                raise_conversion_error(
+                    "STEP0012_DISCARD_SUMMARY_EXCEL_WRITE_FAILED",
+                    "failed to create step0012 discard summary Excel. Path = "
+                    + pszOutputPath + "; Detail = " + str(objException),
+                )
+            finally:
+                if objWorkbook is not None:
+                    objWorkbook.close()
+                if pszTemporaryPath and os.path.exists(pszTemporaryPath):
+                    os.remove(pszTemporaryPath)
+                if bOutputReserved and os.path.exists(pszOutputPath):
+                    os.remove(pszOutputPath)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0012_DISCARD_SUMMARY_EXCEL_CLEANUP_FAILED",
+                "step0012 discard summary Excel creation failed. Original error = "
+                + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 STEP0004_TOTAL_PLACEMENT_AVERAGE_ITEMS: List[str] = [
     "入雛羽数", "平均体重",
 ]
@@ -15279,6 +15411,11 @@ def main() -> int:
         arrStep0012DiscardSummaryPaths = create_step0012_discard_summary_files(
             arrStep0011DiscardSummaryPaths
         )
+        arrStep0012DiscardSummaryExcelPaths = (
+            create_step0012_discard_summary_excel_files(
+                arrStep0012DiscardSummaryPaths
+            )
+        )
         arrStep0004Paths, arrStep0004YearMonths = create_step0004_files(
             pszOutputTsvPath, arrStep0003Paths, arrStep0003YearMonths
         )
@@ -15568,6 +15705,10 @@ def main() -> int:
     print("step0010総計廃棄データ一覧表ファイル数: " + str(len(arrStep0010DiscardSummaryPaths)))
     print("step0011総計廃棄データ一覧表ファイル数: " + str(len(arrStep0011DiscardSummaryPaths)))
     print("step0012総計廃棄データ一覧表ファイル数: " + str(len(arrStep0012DiscardSummaryPaths)))
+    print(
+        "step0012総計廃棄データ一覧表Excelファイル数: "
+        + str(len(arrStep0012DiscardSummaryExcelPaths))
+    )
     if arrStep0003YearMonths:
         print(
             "step0003最初の年月: "
