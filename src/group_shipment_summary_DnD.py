@@ -361,6 +361,7 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "合計追加後の年間TSVからExcelを作成します。\n"
         "年間TSVの右端に年間合計列を追加します。\n"
         "年間合計列付きTSVからExcelを作成します。\n"
+        "step0010グループ別Excelの各列幅を自動調整します。\n"
         "その他のシートは処理しません。\n\n"
         "1回につき1ファイルだけ処理できます。\n"
         "出力TSVは入力Excelと同じフォルダに作成します。\n\n"
