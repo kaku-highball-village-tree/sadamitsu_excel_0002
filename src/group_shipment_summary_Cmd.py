@@ -15721,7 +15721,7 @@ def main() -> int:
         )
         arrStep0008ExcelPaths = create_step0008_excel_files(arrStep0008Paths)
         arrStep0009Paths = create_step0009_files(arrStep0008Paths)
-        arrStep0009ExcelPaths = create_step0009_excel_files(arrStep0009Paths)
+        arrStep0009ExcelPaths: List[str] = []
         arrStep0010Paths = create_step0010_files(arrStep0009Paths)
         arrStep0010ExcelPaths = create_step0010_excel_files(arrStep0010Paths)
     except Exception as objException:
@@ -15998,8 +15998,7 @@ def main() -> int:
     print("step0008 Excelファイル数: " + str(len(arrStep0008ExcelPaths)))
     print("step0009入力ファイル数: " + str(len(arrStep0008Paths)))
     print("step0009ファイル数: " + str(len(arrStep0009Paths)))
-    print("step0009 Excel入力ファイル数: " + str(len(arrStep0009Paths)))
-    print("step0009 Excelファイル数: " + str(len(arrStep0009ExcelPaths)))
+    print("step0009グループ別Excelは作成しません。")
     print("step0010入力ファイル数: " + str(len(arrStep0009Paths)))
     print("step0010ファイル数: " + str(len(arrStep0010Paths)))
     print("step0010 Excel入力ファイル数: " + str(len(arrStep0010Paths)))
