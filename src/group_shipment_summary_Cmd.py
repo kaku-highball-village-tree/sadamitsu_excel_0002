@@ -15719,7 +15719,7 @@ def main() -> int:
             pszWarningPath,
             iWarningCount,
         )
-        arrStep0008ExcelPaths = create_step0008_excel_files(arrStep0008Paths)
+        arrStep0008ExcelPaths: List[str] = []
         arrStep0009Paths = create_step0009_files(arrStep0008Paths)
         arrStep0009ExcelPaths: List[str] = []
         arrStep0010Paths = create_step0010_files(arrStep0009Paths)
@@ -15994,8 +15994,7 @@ def main() -> int:
     print("step0007 Excelファイル数: " + str(len(arrStep0007ExcelPaths)))
     print("step0008入力ファイル数: " + str(len(arrStep0007Paths)))
     print("step0008ファイル数: " + str(len(arrStep0008Paths)))
-    print("step0008 Excel入力ファイル数: " + str(len(arrStep0008Paths)))
-    print("step0008 Excelファイル数: " + str(len(arrStep0008ExcelPaths)))
+    print("step0008グループ別年間Excelは作成しません。")
     print("step0009入力ファイル数: " + str(len(arrStep0008Paths)))
     print("step0009ファイル数: " + str(len(arrStep0009Paths)))
     print("step0009グループ別Excelは作成しません。")
@@ -16006,7 +16005,7 @@ def main() -> int:
     print("警告件数: " + str(iWarningCount))
     if pszWarningPath:
         print("警告ファイル: " + pszWarningPath)
-    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・年間Excel作成・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・step0008年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0010年間Excel作成・step0013グループ別控除廃棄年間Excel作成完了 ◇")
+    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0010年間Excel作成・step0013グループ別控除廃棄年間Excel作成完了 ◇")
     print("入力Excel: " + pszInputExcelPath)
     print("出力フォルダ: " + os.path.dirname(pszOutputTsvPath))
     return 0
