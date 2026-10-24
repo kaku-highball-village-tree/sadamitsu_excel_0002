@@ -15002,6 +15002,52 @@ def write_step0013_group_deduction_excel(
                         objCell.number_format = "0.000"
                     elif pszItemName == "育成率":
                         objCell.number_format = "0.0000"
+            for iColumnIndex in range(1, objWorksheet.max_column + 1):
+                iMaximumDisplayWidth = 0
+                for objWidthCell in objWorksheet.iter_cols(
+                    min_col=iColumnIndex,
+                    max_col=iColumnIndex,
+                    min_row=1,
+                    max_row=objWorksheet.max_row,
+                ):
+                    for objCell in objWidthCell:
+                        objValue = objCell.value
+                        if objValue is None:
+                            continue
+                        if isinstance(objValue, (int, float, Decimal)):
+                            objDecimalValue = Decimal(str(objValue))
+                            pszFractionFormat = objCell.number_format.split(";")[0].partition(".")[2]
+                            iFractionPlaces = sum(
+                                1 for pszCharacter in pszFractionFormat
+                                if pszCharacter in "0#"
+                            )
+                            pszDisplayValue = format(
+                                objDecimalValue, "." + str(iFractionPlaces) + "f"
+                            )
+                            if iFractionPlaces:
+                                iMinimumFractionPlaces = pszFractionFormat.count("0")
+                                while (
+                                    len(pszDisplayValue.rsplit(".", 1)[-1])
+                                    > iMinimumFractionPlaces
+                                    and pszDisplayValue.endswith("0")
+                                ):
+                                    pszDisplayValue = pszDisplayValue[:-1]
+                                if pszDisplayValue.endswith("."):
+                                    pszDisplayValue = pszDisplayValue[:-1]
+                        else:
+                            pszDisplayValue = str(objValue)
+                        iDisplayWidth = sum(
+                            2 if unicodedata.east_asian_width(pszCharacter)
+                            in {"F", "W"}
+                            else 1
+                            for pszCharacter in pszDisplayValue
+                        )
+                        iMaximumDisplayWidth = max(
+                            iMaximumDisplayWidth, iDisplayWidth
+                        )
+                objWorksheet.column_dimensions[
+                    get_column_letter(iColumnIndex)
+                ].width = min(max(iMaximumDisplayWidth + 2, 8), 255)
             objWorkbook.save(pszTemporaryPath)
             objWorkbook.close()
             objWorkbook = None
