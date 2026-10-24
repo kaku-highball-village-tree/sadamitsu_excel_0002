@@ -6574,6 +6574,277 @@ def create_step0013_group_deduction_files(
         raise
 
 
+STEP0014_GROUP_DEDUCTION_ROW_STRUCTURE: List[Tuple[str, str]] = [
+    ("", "年"),
+    ("", "月"),
+]
+for _, pszGroupName in GROUPS:
+    STEP0014_GROUP_DEDUCTION_ROW_STRUCTURE.extend(
+        [
+            (pszGroupName, "入雛羽数"),
+            ("", "処理羽数"),
+            ("", "処理重量"),
+            ("", "平均体重"),
+            ("", "育成率"),
+        ]
+    )
+STEP0014_GROUP_DEDUCTION_ROW_STRUCTURE.extend(
+    [
+        ("合計", "入雛羽数"),
+        ("", "処理羽数"),
+        ("", "処理重量"),
+        ("", "平均体重"),
+        ("", "育成率"),
+    ]
+)
+
+
+def create_step0014_group_deduction_output_path(
+    pszStep0013Path: str,
+) -> str:
+    pszDirectory = os.path.dirname(pszStep0013Path)
+    pszFileName = os.path.basename(pszStep0013Path)
+    objMatch = re.search(
+        r"_step0013_グループ別_控除廃棄_(\d{4}_年間)(?:_(\d{2}))?\.tsv$",
+        pszFileName,
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0013_GROUP_DEDUCTION_FILENAME",
+            "unexpected step0013 group deduction file name. Path = "
+            + pszStep0013Path,
+        )
+    pszOutputName = re.sub(
+        r"_step0013_グループ別_控除廃棄_",
+        "_step0014_グループ別_控除廃棄_",
+        pszFileName,
+        count=1,
+    )
+    pszStem, pszExtension = os.path.splitext(pszOutputName)
+    pszOutputPath = os.path.join(pszDirectory, pszOutputName)
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}{pszExtension}"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def read_step0013_for_step0014(
+    pszInputPath: str,
+) -> List[List[str]]:
+    objMatch = re.search(
+        r"_step0013_グループ別_控除廃棄_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0013_GROUP_DEDUCTION_FILENAME",
+            "unexpected step0013 group deduction file name. Path = "
+            + pszInputPath,
+        )
+    iExpectedYear = int(objMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8", newline="") as objFile:
+            arrRows = [
+                strip_line_ending(pszLine).split("\t") for pszLine in objFile
+            ]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0014_GROUP_DEDUCTION_READ_FAILED",
+            "failed to read step0013 TSV. Path = "
+            + pszInputPath
+            + ", Detail = "
+            + str(objException),
+        )
+    if len(arrRows) != len(STEP0014_GROUP_DEDUCTION_ROW_STRUCTURE):
+        raise_conversion_error(
+            "INVALID_STEP0013_GROUP_DEDUCTION_ROW_COUNT",
+            "step0013 TSV must contain 22 rows. Path = " + pszInputPath,
+        )
+    if any(len(arrRow) != 14 for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0013_GROUP_DEDUCTION_COLUMN_COUNT",
+            "step0013 TSV must contain 14 columns. Path = " + pszInputPath,
+        )
+    for iRowIndex, objExpected in enumerate(
+        STEP0014_GROUP_DEDUCTION_ROW_STRUCTURE
+    ):
+        objActual = tuple(
+            pszValue.strip(" \u3000\t") for pszValue in arrRows[iRowIndex][:2]
+        )
+        if objActual != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0013_GROUP_DEDUCTION_ROW_STRUCTURE",
+                "unexpected step0013 row structure. Path = "
+                + pszInputPath
+                + ", Line = "
+                + str(iRowIndex + 1),
+            )
+    for iMonthIndex in range(12):
+        iColumnIndex = iMonthIndex + 2
+        iYear, iMonth = parse_year_month(
+            arrRows[0][iColumnIndex], arrRows[1][iColumnIndex], iColumnIndex + 1
+        )
+        if iYear != iExpectedYear or iMonth != iMonthIndex + 1:
+            raise_conversion_error(
+                "INVALID_STEP0013_GROUP_DEDUCTION_YEAR_MONTH",
+                "step0013 year or month did not match its file name or column. Path = "
+                + pszInputPath
+                + ", Column = "
+                + str(iColumnIndex + 1),
+            )
+        for iRowIndex in range(2, len(arrRows)):
+            pszItemName = STEP0014_GROUP_DEDUCTION_ROW_STRUCTURE[iRowIndex][1]
+            objValue = parse_decimal_value(
+                arrRows[iRowIndex][iColumnIndex],
+                iRowIndex + 1,
+                iColumnIndex,
+                pszItemName,
+            )
+            if objValue is None and pszItemName not in {"平均体重", "育成率"}:
+                raise_conversion_error(
+                    "INVALID_STEP0013_GROUP_DEDUCTION_ITEM_VALUE",
+                    "step0013 required value was blank. Path = "
+                    + pszInputPath
+                    + ", Line = "
+                    + str(iRowIndex + 1),
+                )
+            if (
+                objValue is not None
+                and pszItemName in {"入雛羽数", "処理羽数"}
+                and objValue != objValue.to_integral_value()
+            ):
+                raise_conversion_error(
+                    "INVALID_STEP0013_GROUP_DEDUCTION_ITEM_VALUE",
+                    "step0013 count was not an integer. Path = "
+                    + pszInputPath
+                    + ", Line = "
+                    + str(iRowIndex + 1),
+                )
+    return arrRows
+
+
+def create_step0014_group_deduction_rows(
+    arrStep0013Rows: List[List[str]],
+) -> List[List[str]]:
+    arrOutputRows = [arrRow.copy() + [""] for arrRow in arrStep0013Rows]
+    dicAnnualValues: Dict[str, Dict[str, Decimal]] = {}
+    for iGroupIndex, (_, pszGroupName) in enumerate(GROUPS):
+        iFirstRow = 2 + iGroupIndex * 5
+        dicValues: Dict[str, Decimal] = {}
+        for iOffset, pszItemName in enumerate(
+            ["入雛羽数", "処理羽数", "処理重量"]
+        ):
+            iRowIndex = iFirstRow + iOffset
+            objTotal = sum(
+                (
+                    Decimal(arrStep0013Rows[iRowIndex][iColumnIndex])
+                    for iColumnIndex in range(2, 14)
+                ),
+                Decimal("0"),
+            )
+            dicValues[pszItemName] = objTotal
+            arrOutputRows[iRowIndex][14] = format_sum_value(objTotal)
+        objProcessed = dicValues["処理羽数"]
+        objPlacement = dicValues["入雛羽数"]
+        objProcessedWeight = dicValues["処理重量"]
+        objAverageWeight = (
+            (objProcessedWeight / objProcessed).quantize(
+                Decimal("0.001"), rounding=ROUND_HALF_UP
+            )
+            if objProcessed != 0
+            else Decimal("0")
+        )
+        objGrowthRate = (
+            (objProcessed / objPlacement).quantize(
+                Decimal("0.0001"), rounding=ROUND_HALF_UP
+            )
+            if objPlacement != 0
+            else Decimal("0")
+        )
+        arrOutputRows[iFirstRow + 3][14] = format_sum_value(objAverageWeight)
+        arrOutputRows[iFirstRow + 4][14] = format_sum_value(objGrowthRate)
+        dicAnnualValues[pszGroupName] = dicValues
+
+    iTotalRow = 17
+    dicTotalValues = {
+        pszItemName: sum(
+            (dicAnnualValues[pszGroupName][pszItemName] for _, pszGroupName in GROUPS),
+            Decimal("0"),
+        )
+        for pszItemName in ["入雛羽数", "処理羽数", "処理重量"]
+    }
+    for iOffset, pszItemName in enumerate(
+        ["入雛羽数", "処理羽数", "処理重量"]
+    ):
+        arrOutputRows[iTotalRow + iOffset][14] = format_sum_value(
+            dicTotalValues[pszItemName]
+        )
+    objTotalProcessed = dicTotalValues["処理羽数"]
+    objTotalPlacement = dicTotalValues["入雛羽数"]
+    objTotalWeight = dicTotalValues["処理重量"]
+    objTotalAverageWeight = (
+        (objTotalWeight / objTotalProcessed).quantize(
+            Decimal("0.001"), rounding=ROUND_HALF_UP
+        )
+        if objTotalProcessed != 0
+        else Decimal("0")
+    )
+    objTotalGrowthRate = (
+        (objTotalProcessed / objTotalPlacement).quantize(
+            Decimal("0.0001"), rounding=ROUND_HALF_UP
+        )
+        if objTotalPlacement != 0
+        else Decimal("0")
+    )
+    arrOutputRows[20][14] = format_sum_value(objTotalAverageWeight)
+    arrOutputRows[21][14] = format_sum_value(objTotalGrowthRate)
+    return arrOutputRows
+
+
+def create_step0014_group_deduction_files(
+    arrStep0013Paths: List[str],
+) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0013Path in arrStep0013Paths:
+            arrInputRows = read_step0013_for_step0014(pszStep0013Path)
+            arrOutputRows = create_step0014_group_deduction_rows(arrInputRows)
+            pszOutputPath = create_step0014_group_deduction_output_path(
+                pszStep0013Path
+            )
+            try:
+                write_monthly_tsv(
+                    pszOutputPath,
+                    "\t".join(arrOutputRows[0]),
+                    ["\t".join(arrRow) for arrRow in arrOutputRows[1:]],
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "STEP0014_GROUP_DEDUCTION_WRITE_FAILED", str(objException)
+                )
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0014_GROUP_DEDUCTION_CLEANUP_FAILED",
+                "step0014 creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 
 def create_step0006_discard_summary_upper_output_path(
     pszPlacementAveragePath: str,
@@ -15701,6 +15972,11 @@ def main() -> int:
                 arrStep0013GroupDeductionPaths
             )
         )
+        arrStep0014GroupDeductionPaths = (
+            create_step0014_group_deduction_files(
+                arrStep0013GroupDeductionPaths
+            )
+        )
         arrStep0005Paths, arrStep0005Years = create_step0005_files(
             pszOutputTsvPath, arrStep0004Paths, arrStep0004YearMonths
         )
@@ -15730,7 +16006,7 @@ def main() -> int:
         )
         pszErrorDetail: str = str(objException)
         print(
-            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 and step0010 annual TSVs or step0010 Excel files, create variety deduction step0009 and step0010 annual TSVs or step0010 Excel files, add annual totals, or add yearly total columns, or create step0013 group deduction Excel files. Detail = "
+            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 and step0010 annual TSVs or step0010 Excel files, create variety deduction step0009 and step0010 annual TSVs or step0010 Excel files, add annual totals, or add yearly total columns, or create step0013 group deduction Excel or step0014 annual TSV files. Detail = "
             + pszErrorDetail,
             file=sys.stderr,
         )
@@ -15908,6 +16184,10 @@ def main() -> int:
         + str(len(arrStep0013GroupDeductionExcelPaths))
     )
     print(
+        "step0014グループ別控除廃棄年間ファイル数: "
+        + str(len(arrStep0014GroupDeductionPaths))
+    )
+    print(
         "step0005グループ別廃棄羽数ファイル数: "
         + str(len(arrStep0005GroupDiscardCountPaths))
     )
@@ -16005,7 +16285,7 @@ def main() -> int:
     print("警告件数: " + str(iWarningCount))
     if pszWarningPath:
         print("警告ファイル: " + pszWarningPath)
-    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0010年間Excel作成・step0013グループ別控除廃棄年間Excel作成完了 ◇")
+    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0010年間Excel作成・step0013グループ別控除廃棄年間Excel・step0014グループ別控除廃棄年間TSV作成完了 ◇")
     print("入力Excel: " + pszInputExcelPath)
     print("出力フォルダ: " + os.path.dirname(pszOutputTsvPath))
     return 0
