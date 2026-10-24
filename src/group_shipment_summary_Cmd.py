@@ -14046,6 +14046,56 @@ def write_step0010_variety_excel(
                             "0" if objValue == objValue.to_integral_value()
                             else "0." + "#" * iDecimalPlaces
                         )
+            for iColumnIndex in range(1, objWorksheet.max_column + 1):
+                iMaximumDisplayWidth = 0
+                for objWidthColumn in objWorksheet.iter_cols(
+                    min_col=iColumnIndex,
+                    max_col=iColumnIndex,
+                    min_row=1,
+                    max_row=objWorksheet.max_row,
+                ):
+                    for objWidthCell in objWidthColumn:
+                        objWidthValue = objWidthCell.value
+                        if objWidthValue is None:
+                            continue
+                        if isinstance(objWidthValue, (int, float, Decimal)):
+                            objWidthDecimal = Decimal(str(objWidthValue))
+                            pszFractionFormat = (
+                                objWidthCell.number_format.split(";")[0]
+                                .partition(".")[2]
+                            )
+                            iFractionPlaces = sum(
+                                1 for pszCharacter in pszFractionFormat
+                                if pszCharacter in "0#"
+                            )
+                            pszDisplayValue = format(
+                                objWidthDecimal,
+                                "." + str(iFractionPlaces) + "f",
+                            )
+                            if iFractionPlaces:
+                                iMinimumFractionPlaces = pszFractionFormat.count("0")
+                                while (
+                                    len(pszDisplayValue.rsplit(".", 1)[-1])
+                                    > iMinimumFractionPlaces
+                                    and pszDisplayValue.endswith("0")
+                                ):
+                                    pszDisplayValue = pszDisplayValue[:-1]
+                                if pszDisplayValue.endswith("."):
+                                    pszDisplayValue = pszDisplayValue[:-1]
+                        else:
+                            pszDisplayValue = str(objWidthValue)
+                        iDisplayWidth = sum(
+                            2 if unicodedata.east_asian_width(pszCharacter)
+                            in {"F", "W"}
+                            else 1
+                            for pszCharacter in pszDisplayValue
+                        )
+                        iMaximumDisplayWidth = max(
+                            iMaximumDisplayWidth, iDisplayWidth
+                        )
+                objWorksheet.column_dimensions[
+                    get_column_letter(iColumnIndex)
+                ].width = min(max(iMaximumDisplayWidth + 2, 8), 255)
             objWorkbook.save(pszTemporaryPath)
             objWorkbook.close()
             objWorkbook = None
