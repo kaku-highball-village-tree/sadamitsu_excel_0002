@@ -124,6 +124,13 @@ def run_excel_to_tsv(pszInputExcelPath: str) -> None:
         + "\n\n元TSV:\n"
         + pszOutputTsvPath
     )
+    arrDailyOperationPaths: List[str] = [
+        pszLine[len("日別稼動判定ファイル: ") :]
+        for pszLine in pszStdOut.splitlines()
+        if pszLine.startswith("日別稼動判定ファイル: ")
+    ]
+    if arrDailyOperationPaths:
+        pszMessage += "\n\n日別稼動判定TSV:\n" + "\n".join(arrDailyOperationPaths)
     if pszWarningFilePath:
         pszMessage += "\n\n警告ファイル:\n" + pszWarningFilePath
     show_message_box(pszMessage)
@@ -366,6 +373,9 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "年間TSVの右端に年間合計列を追加します。\n"
         "年間合計列付きTSVからExcelを作成します。\n"
         "step0010グループ別Excelの各列幅を自動調整します。\n"
+        "step0001のO列「処理日」から年別の日別稼動判定TSVを追加出力します。\n"
+        "4行目は1～12月、64行目は稼動日数、65～95行目は1～31日の0／1です。\n"
+        "未提供月は空欄、存在しない日は0です。判定TSVはUTF-8 BOM付きです。\n"
         "その他のシートは処理しません。\n\n"
         "1回につき1ファイルだけ処理できます。\n"
         "出力TSVは入力Excelと同じフォルダに作成します。\n\n"
