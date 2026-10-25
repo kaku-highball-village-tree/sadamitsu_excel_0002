@@ -23,6 +23,139 @@ def show_error_message_box(pszMessage: str, pszTitle: str = WINDOW_TITLE) -> Non
     win32gui.MessageBox(0, pszMessage, pszTitle, win32con.MB_OK | win32con.MB_ICONERROR)
 
 
+def show_completion_dialog(
+    pszOutputDirectory: str, bHasWarning: bool, pszDetails: str
+) -> None:
+    """短い完了画面と、スクロール可能な詳細画面を表示します。"""
+    import tkinter as tk
+    from tkinter import ttk
+
+    iOwner = win32gui.GetForegroundWindow()
+    objMonitor = win32api.MonitorFromWindow(iOwner, win32con.MONITOR_DEFAULTTONEAREST)
+    iLeft, iTop, iRight, iBottom = win32api.GetMonitorInfo(objMonitor)["Work"]
+    # ウィンドウ枠・タイトルバーも作業領域に収まる余白を確保します。
+    iMaxWidth = max(1, iRight - iLeft - 64)
+    iMaxHeight = max(1, iBottom - iTop - 96)
+    objRoot = tk.Tk()
+    objRoot.withdraw()
+    objRoot.title(WINDOW_TITLE)
+    objRoot.attributes("-topmost", True)
+    bOwnerDisabled = False
+
+    def place_window(objWindow: object, iWidth: int, iHeight: int) -> None:
+        iWidth = min(iWidth, iMaxWidth)
+        iHeight = min(iHeight, iMaxHeight)
+        iX = iLeft + (iRight - iLeft - iWidth) // 2
+        iY = iTop + (iBottom - iTop - iHeight) // 2
+        objWindow.maxsize(iMaxWidth, iMaxHeight)
+        objWindow.geometry(f"{iWidth}x{iHeight}")
+        objWindow.update_idletasks()
+        win32gui.SetWindowPos(
+            win32gui.GetParent(objWindow.winfo_id()), 0, iX, iY, 0, 0,
+            win32con.SWP_NOSIZE | win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE,
+        )
+
+    def open_output_directory() -> None:
+        try:
+            if not os.path.isdir(pszOutputDirectory):
+                raise OSError("output directory was not found")
+            os.startfile(pszOutputDirectory)
+        except OSError:
+            show_error_message_box("出力フォルダーを開けませんでした。表示されたパスを確認してください。")
+
+    def show_details() -> None:
+        objDetails = tk.Toplevel(objRoot)
+        objDetails.withdraw()
+        objDetails.title("処理結果の詳細")
+        objDetails.transient(objRoot)
+        place_window(objDetails, 900, 560)
+        objDetails.rowconfigure(0, weight=1)
+        objDetails.columnconfigure(0, weight=1)
+        objTextFrame = ttk.Frame(objDetails, padding=8)
+        objTextFrame.grid(row=0, column=0, sticky="nsew")
+        objTextFrame.rowconfigure(0, weight=1)
+        objTextFrame.columnconfigure(0, weight=1)
+        objText = tk.Text(objTextFrame, wrap="none", width=1, height=1)
+        objVertical = ttk.Scrollbar(objTextFrame, orient="vertical", command=objText.yview)
+        objHorizontal = ttk.Scrollbar(objTextFrame, orient="horizontal", command=objText.xview)
+        objText.configure(yscrollcommand=objVertical.set, xscrollcommand=objHorizontal.set)
+        objText.grid(row=0, column=0, sticky="nsew")
+        objVertical.grid(row=0, column=1, sticky="ns")
+        objHorizontal.grid(row=1, column=0, sticky="ew")
+        objText.insert("1.0", pszDetails)
+        objText.configure(state="disabled")
+
+        def select_all(objEvent: object) -> str:
+            objText.tag_add("sel", "1.0", "end-1c")
+            return "break"
+
+        objText.bind("<Control-a>", select_all)
+        objText.bind("<Control-A>", select_all)
+        objClose = ttk.Button(objDetails, text="閉じる", command=objDetails.destroy)
+        objClose.grid(row=1, column=0, pady=(0, 8))
+        objDetails.bind("<Escape>", lambda event: objDetails.destroy())
+        objDetails.bind("<Return>", lambda event: objDetails.destroy())
+        objDetails.protocol("WM_DELETE_WINDOW", objDetails.destroy)
+        objDetails.deiconify()
+        objDetails.grab_set()
+        objText.focus_set()
+        objRoot.wait_window(objDetails)
+        objRoot.grab_set()
+        objOk.focus_set()
+
+    try:
+        place_window(objRoot, 700, 300)
+        objRoot.columnconfigure(0, weight=1)
+        objRoot.rowconfigure(0, weight=1)
+        objSummary = ttk.Frame(objRoot, padding=12)
+        objSummary.grid(row=0, column=0, sticky="nsew")
+        objSummary.columnconfigure(0, weight=1)
+        ttk.Label(
+            objSummary,
+            text="処理が警告付きで完了しました。" if bHasWarning else "処理が完了しました。",
+        ).grid(row=0, column=0, sticky="w", pady=(0, 12))
+        ttk.Label(objSummary, text="出力フォルダー:").grid(row=1, column=0, sticky="w")
+        objPathValue = tk.StringVar(objRoot, value=pszOutputDirectory)
+        objPath = ttk.Entry(objSummary, state="readonly", textvariable=objPathValue)
+        objPath.grid(row=2, column=0, sticky="ew", pady=4)
+        objPathScroll = ttk.Scrollbar(objSummary, orient="horizontal", command=objPath.xview)
+        objPath.configure(xscrollcommand=objPathScroll.set)
+        objPathScroll.grid(row=3, column=0, sticky="ew")
+        ttk.Label(objSummary, text="警告: " + ("あり" if bHasWarning else "なし")).grid(
+            row=4, column=0, sticky="w", pady=8
+        )
+        objButtons = ttk.Frame(objRoot, padding=8)
+        objButtons.grid(row=1, column=0, sticky="ew")
+        arrButtons = [
+            ttk.Button(objButtons, text="詳細", command=show_details),
+            ttk.Button(objButtons, text="出力フォルダーを開く", command=open_output_directory),
+            ttk.Button(objButtons, text="OK", command=objRoot.destroy),
+        ]
+        bStackButtons = iMaxWidth < 600
+        for iIndex, objButton in enumerate(arrButtons):
+            objButton.grid(row=iIndex if bStackButtons else 0, column=0 if bStackButtons else iIndex, padx=4, pady=3, sticky="ew")
+            objButtons.columnconfigure(0 if bStackButtons else iIndex, weight=1)
+        objOk = arrButtons[-1]
+        objRoot.bind("<Return>", lambda event: objRoot.destroy())
+        objRoot.bind("<Escape>", lambda event: objRoot.destroy())
+        objRoot.protocol("WM_DELETE_WINDOW", objRoot.destroy)
+        if iOwner and win32gui.IsWindow(iOwner) and win32gui.IsWindowEnabled(iOwner):
+            win32gui.EnableWindow(iOwner, False)
+            bOwnerDisabled = True
+        objRoot.deiconify()
+        objRoot.grab_set()
+        objOk.focus_set()
+        objRoot.mainloop()
+    finally:
+        if bOwnerDisabled and win32gui.IsWindow(iOwner):
+            win32gui.EnableWindow(iOwner, True)
+            win32gui.SetForegroundWindow(iOwner)
+        try:
+            objRoot.destroy()
+        except tk.TclError:
+            pass
+
+
 def create_output_path(pszInputExcelPath: str) -> str:
     pszDirectory: str = os.path.dirname(pszInputExcelPath)
     pszBaseName: str = os.path.splitext(os.path.basename(pszInputExcelPath))[0]
@@ -154,7 +287,7 @@ def run_excel_to_tsv(pszInputExcelPath: str) -> None:
         pszMessage += "\n\n一日平均処理羽数の前年比付きstep0017 TSV:\n" + "\n".join(arrStep0017Paths)
     if pszWarningFilePath:
         pszMessage += "\n\n警告ファイル:\n" + pszWarningFilePath
-    show_message_box(pszMessage)
+    show_completion_dialog(os.path.dirname(pszOutputTsvPath), bool(pszWarningFilePath), pszMessage)
 
 
 def draw_instruction_text(iWindowHandle: int) -> None:
