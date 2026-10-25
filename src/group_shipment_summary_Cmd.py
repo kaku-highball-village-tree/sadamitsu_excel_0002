@@ -16054,7 +16054,7 @@ def create_step0011_group_files(
 
 
 def create_step0012_group_files(arrStep0011Paths: List[str]) -> List[str]:
-    """当年表に空行2行と前年合計6行を追加します。2022年は無変更コピーです。"""
+    """当年表に前年合計6行を追加し、稼動日数の年間合計を出力します。"""
     dicInputs: Dict[Tuple[str, str, int], str] = {}
     for pszPath in arrStep0011Paths:
         objMatch = re.fullmatch(
@@ -16118,6 +16118,24 @@ def create_step0012_group_files(arrStep0011Paths: List[str]) -> List[str]:
                 # 元の内容を保持し、最終行との間に空行をちょうど2行設けます。
                 objOutput = objCurrent.rstrip(b"\r\n") + objNewline * 3
                 objOutput += (pszNewline.join("\t".join(row) for row in arrTotals) + pszNewline).encode("utf-8")
+            # 稼動日数行のO列だけを書き換え、他のバイト列・改行は保持します。
+            arrOutputLines = objOutput.splitlines(keepends=True)
+            for iLineIndex, objLine in enumerate(arrOutputLines):
+                objBody = objLine.rstrip(b"\r\n")
+                arrFields = objBody.split(b"\t")
+                if len(arrFields) >= 2 and arrFields[1] == "稼動日数".encode("utf-8"):
+                    if len(arrFields) != 15:
+                        raise ValueError("稼動日数行は15列である必要があります。")
+                    iTotalDays = 0
+                    for objValue in arrFields[2:14]:
+                        if objValue == b"":
+                            continue
+                        if re.fullmatch(rb"[0-9]+", objValue) is None:
+                            raise ValueError("稼動日数は空欄または非負の整数である必要があります。")
+                        iTotalDays += int(objValue)
+                    arrFields[14] = str(iTotalDays).encode("ascii")
+                    arrOutputLines[iLineIndex] = b"\t".join(arrFields) + objLine[len(objBody):]
+            objOutput = b"".join(arrOutputLines)
             with open(pszOutputPath, "xb") as objFile:
                 bReserved = True
                 objFile.write(objOutput)
