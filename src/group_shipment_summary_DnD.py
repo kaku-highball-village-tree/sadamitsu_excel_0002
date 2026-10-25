@@ -145,6 +145,13 @@ def run_excel_to_tsv(pszInputExcelPath: str) -> None:
     ]
     if arrStep0016Paths:
         pszMessage += "\n\n前年実績付きstep0016 TSV:\n" + "\n".join(arrStep0016Paths)
+    arrStep0017Paths: List[str] = [
+        line[len("step0017グループ別控除廃棄年間ファイル: ") :]
+        for line in pszStdOut.splitlines()
+        if line.startswith("step0017グループ別控除廃棄年間ファイル: ")
+    ]
+    if arrStep0017Paths:
+        pszMessage += "\n\n一日平均処理羽数の前年比付きstep0017 TSV:\n" + "\n".join(arrStep0017Paths)
     if pszWarningFilePath:
         pszMessage += "\n\n警告ファイル:\n" + pszWarningFilePath
     show_message_box(pszMessage)
@@ -398,6 +405,8 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "項目は入雛羽数・処理羽数・処理重量・平均体重・育成率・稼動日数です。\n"
         "前年欄は前年実績・前年の年表記とし、2022年は前年行を追加しません。\n"
         "step0016の当年・前年の稼動日数合計をO列に整数で出力します。\n"
+        "step0016の24・25行目に一日平均処理羽数の前年比を追加したstep0017を出力します。\n"
+        "前年比は小数点以下4桁で四捨五入し、計算不能は空欄、2022年はそのままコピーします。\n"
         "step0001のO列「処理日」から年別の日別稼動判定TSVを追加出力します。\n"
         "1行目は対象年（例：2026年）と半角数字の1～12月、2行目は稼動日数、3～33行目は1～31日の0／1です。\n"
         "未提供月は空欄、存在しない日は0です。判定TSVはUTF-8 BOM付きです。\n"

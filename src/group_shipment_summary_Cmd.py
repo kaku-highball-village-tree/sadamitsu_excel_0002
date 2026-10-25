@@ -16261,6 +16261,82 @@ def create_step0016_group_deduction_files(arrStep0015Paths: List[str]) -> List[s
     return arrCreatedPaths
 
 
+def create_step0017_group_deduction_files(arrStep0016Paths: List[str]) -> List[str]:
+    """step0016の空行2行を一日平均処理羽数の前年比に置き換えます。"""
+    arrCreatedPaths: List[str] = []
+    arrErrors: List[str] = []
+    for pszInputPath in arrStep0016Paths:
+        bReserved = False
+        pszOutputPath = ""
+        try:
+            objMatch = re.fullmatch(
+                r"(.+)_step0016_グループ別_控除廃棄_([0-9]{4})_年間(?:_[0-9]+)?\.tsv",
+                os.path.basename(pszInputPath),
+            )
+            if objMatch is None:
+                raise ValueError("step0016のファイル名が不正です。")
+            pszPrefix, pszYear = objMatch.groups()
+            iYear = int(pszYear)
+            pszOutputPath = os.path.join(
+                os.path.dirname(pszInputPath),
+                f"{pszPrefix}_step0017_グループ別_控除廃棄_{iYear:04d}_年間.tsv",
+            )
+            with open(pszInputPath, "rb") as objFile:
+                objInput = objFile.read()
+            objOutput = objInput
+            if iYear != 2022:
+                arrLines = objInput.splitlines(keepends=True)
+                arrRows = [line.split("\t") for line in objInput.decode("utf-8-sig").splitlines()]
+                if (len(arrRows) != 31
+                        or any(len(row) != 15 for i, row in enumerate(arrRows) if i not in (23, 24))):
+                    raise ValueError("step0016は31行で、空行以外は15列である必要があります。")
+                if any(value for i in (23, 24) for value in arrRows[i]):
+                    raise ValueError("24・25行目は空行である必要があります。")
+                if (arrRows[0] != ["", "年"] + [str(iYear)] * 12 + [""]
+                        or arrRows[1][:2] != ["", "月"] or arrRows[1][14] != ""
+                        or any(re.fullmatch(r"[0-9]+", v) is None for v in arrRows[1][2:14])
+                        or [int(v) for v in arrRows[1][2:14]] != list(range(1, 13))):
+                    raise ValueError("step0016の年月見出しが不正です。")
+                arrItems = ["入雛羽数", "処理羽数", "処理重量", "平均体重", "育成率", "稼動日数"]
+                if (arrRows[17][:2] != ["合計", "入雛羽数"]
+                        or [row[1] for row in arrRows[17:23]] != arrItems
+                        or [row[1] for row in arrRows[25:31]] != arrItems
+                        or arrRows[25][0] != "前年実績"
+                        or arrRows[26][0] != f"{iYear - 1}年"):
+                    raise ValueError("当年・前年の合計項目または前年表示が不正です。")
+                arrRatios: List[str] = []
+                for iColumn in range(2, 15):
+                    try:
+                        arrValues = [Decimal(arrRows[iRow][iColumn] or "0") for iRow in (18, 22, 26, 30)]
+                        if any(not value.is_finite() for value in arrValues):
+                            raise ValueError("non-finite value")
+                        objCurrent, objCurrentDays, objPrevious, objPreviousDays = arrValues
+                        if objCurrentDays == 0 or objPreviousDays == 0 or objPrevious == 0:
+                            raise ValueError("division by zero")
+                        objRatio = ((objCurrent / objCurrentDays) / (objPrevious / objPreviousDays)).quantize(
+                            Decimal("0.0001"), rounding=ROUND_HALF_UP
+                        )
+                        arrRatios.append(format(objRatio, ".4f"))
+                    except (ArithmeticError, ValueError):
+                        arrRatios.append("")
+                objNewline = b"\r\n" if b"\r\n" in objInput else (b"\r" if b"\r" in objInput else b"\n")
+                arrLines[23] = "\t".join(["処理羽数", "前年比"] + arrRatios).encode("utf-8") + objNewline
+                arrLines[24] = "\t".join(["", "(一日平均)"] + [""] * 13).encode("utf-8") + objNewline
+                objOutput = b"".join(arrLines)
+            with open(pszOutputPath, "xb") as objFile:
+                bReserved = True
+                objFile.write(objOutput)
+            bReserved = False
+            arrCreatedPaths.append(pszOutputPath)
+        except (OSError, UnicodeError, ValueError) as objException:
+            if bReserved:
+                os.remove(pszOutputPath)
+            arrErrors.append(pszInputPath + ": " + str(objException))
+    if arrErrors:
+        raise_conversion_error("STEP0017_GROUP_DEDUCTION_FAILED", "\n".join(arrErrors))
+    return arrCreatedPaths
+
+
 def convert_excel_to_tsv(pszOutputTsvPath: str, pszInputExcelPath: str) -> Tuple[int, int]:
     try:
         objFormulaWorkbook = load_workbook(
@@ -16723,6 +16799,9 @@ def main() -> int:
         arrStep0016GroupDeductionPaths = create_step0016_group_deduction_files(
             arrStep0015GroupDeductionPaths
         )
+        arrStep0017GroupDeductionPaths = create_step0017_group_deduction_files(
+            arrStep0016GroupDeductionPaths
+        )
         arrStep0005Paths, arrStep0005Years = create_step0005_files(
             pszOutputTsvPath, arrStep0004Paths, arrStep0004YearMonths
         )
@@ -16945,6 +17024,9 @@ def main() -> int:
         "step0015グループ別控除廃棄年間ファイル数: "
         + str(len(arrStep0015GroupDeductionPaths))
     )
+    print("step0017グループ別控除廃棄年間ファイル数: " + str(len(arrStep0017GroupDeductionPaths)))
+    for pszPath in arrStep0017GroupDeductionPaths:
+        print("step0017グループ別控除廃棄年間ファイル: " + pszPath)
     print("step0016グループ別控除廃棄年間ファイル数: " + str(len(arrStep0016GroupDeductionPaths)))
     for pszPath in arrStep0016GroupDeductionPaths:
         print("step0016グループ別控除廃棄年間ファイル: " + pszPath)
