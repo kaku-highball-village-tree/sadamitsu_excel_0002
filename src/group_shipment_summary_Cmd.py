@@ -655,7 +655,7 @@ def split_tsv_by_month(
 
 
 def create_daily_operation_files(arrMonthlyTsvPaths: List[str]) -> List[str]:
-    """step0001の処理日から、年別の95行×13列の稼動判定表を作成します。
+    """step0001の処理日から、年別の33行×13列の稼動判定表を作成します。
 
     最終年月より後の月は未提供として空欄にします。それ以前の不足月や
     入力不備がある年は出力せず、正常な年を出力した後にエラーを報告します。
@@ -694,11 +694,11 @@ def create_daily_operation_files(arrMonthlyTsvPaths: List[str]) -> List[str]:
 
     arrCreatedPaths: List[str] = []
     for (pszDirectory, pszPrefix, iYear), dicMonths in sorted(dicInputs.items()):
-        arrRows: List[List[str]] = [[""] * 13 for _ in range(95)]
-        arrRows[3] = ["日"] + [str(m).translate(str.maketrans("0123456789", "０１２３４５６７８９")) + "月" for m in range(1, 13)]
-        arrRows[63][0] = "稼動日数"
+        arrRows: List[List[str]] = [[""] * 13 for _ in range(33)]
+        arrRows[0] = ["日"] + [str(m).translate(str.maketrans("0123456789", "０１２３４５６７８９")) + "月" for m in range(1, 13)]
+        arrRows[1][0] = "稼動日数"
         for iDay in range(1, 32):
-            arrRows[63 + iDay][0] = str(iDay)
+            arrRows[1 + iDay][0] = str(iDay)
         iLastYear, iLastMonth = dicLastMonths[(pszDirectory, pszPrefix)]
         iExpectedLastMonth = iLastMonth if iYear == iLastYear else 12
         arrYearErrors: List[str] = []
@@ -728,8 +728,8 @@ def create_daily_operation_files(arrMonthlyTsvPaths: List[str]) -> List[str]:
                         setDays.add(objDate.day)
                 iMonthDays = calendar.monthrange(iYear, iMonth)[1]
                 for iDay in range(1, 32):
-                    arrRows[63 + iDay][iMonth] = str(int(iDay <= iMonthDays and iDay in setDays))
-                arrRows[63][iMonth] = str(len(setDays))
+                    arrRows[1 + iDay][iMonth] = str(int(iDay <= iMonthDays and iDay in setDays))
+                arrRows[1][iMonth] = str(len(setDays))
             except (OSError, UnicodeError, csv.Error, ValueError) as objException:
                 arrYearErrors.append(pszPath + ": " + str(objException))
         if arrYearErrors:
