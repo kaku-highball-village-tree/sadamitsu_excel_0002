@@ -1,3 +1,6 @@
+Warning: truncated output (original token count: 6002)
+Total output lines: 350
+
 # -*- coding: utf-8 -*-
 """Excelの「詳細データ」シートをTSVにするWindows DnD画面です。"""
 
@@ -98,7 +101,7 @@ def run_excel_to_tsv(pszInputExcelPath: str) -> None:
             "ExcelからTSVへの変換、年月別分割、グループ別集計・品種別集計・総計集計、または"
             "品種別step0003の43項目と農家廃棄羽数・農家廃棄重量・日令の3項目抽出、日令TSV複製による飼育日数平均ファイル作成、廃棄控除前・控除廃棄育成率作成、品種別step0004の6項目結合とstep0005年間連結・step0006年間行列入れ替え・step0007年間品種別集約、控除廃棄品種別step0004作成とstep0005年間連結・step0006年間行列入れ替え・step0007年間品種別集約、および全廃棄羽数・全廃棄重量・処理羽数・処理重量・控除後平均体重の5項目作成、最新5年のグループ別・総計43項目抽出、総計入雛羽数・平均体重結合、総計出荷羽数・出荷重量結合、総計羽数15項目の過去5年表作成とstep0005縦結合、総計廃棄羽数・重量各15項目結合と小計追加、懸鳥前羽数・重量各2項目結合と小計追加、step0006廃棄データ一覧表上段・下段作成、step0007同表上段・下段の合計列追加、step0008総計廃棄データ一覧表作成、step0009総計廃棄データ一覧表加工、step0010総計廃棄データ一覧表月別連結、グループ別4項目結合、または"
             "グループ別年間連結、年間TSVの行列入れ替え、または"
-            "年別グループ連結・step0008年間TSV作成・年間合計追加・step0009年間TSV作成・年間合計列追加・step0010年間Excel作成・step0014グループ別控除廃棄年間TSV・Excel・step0015年間TSV作成・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV作成・step0010年間Excel作成に"
+            "年別グループ連結・step0008年間TSV作成・年間合計追加・step0009年間TSV作成・年間合計列追加・step0010年間Excel作成・step0010グループ別年間TSVとstep0001日別稼動判定TSVから稼動日数行を追加したstep0011グループ別年間TSV作成・step0014グループ別控除廃棄年間TSV・Excel・step0015年間TSV作成・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV作成・step0010年間Excel作成に"
             "失敗しました。\n\nReturn code = "
             + str(objCompletedProcess.returncode)
             + "\n\nstderr:\n"
@@ -209,7 +212,7 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "警告内容を記載したwarningファイルを作成します。\n"
         "step0002品種別ファイル名には「品種別」を含めます。\n"
         "品種別ファイル名には対象の年と月を含めます。\n"
-        "品種別ファイル名の例：詳細データA_step0002_品種別_2026_07.tsv\n"
+        "品種…2 tokens truncated…イル名の例：詳細データA_step0002_品種別_2026_07.tsv\n"
         "step0002総計ファイルも月ごとに作成します。\n"
         "step0002総計ファイル名には対象の年と月を含めます。\n"
         "品種別・総計の集計対象はそれぞれ同じ月の明細です。\n"
@@ -375,6 +378,8 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "年間TSVの右端に年間合計列を追加します。\n"
         "年間合計列付きTSVからExcelを作成します。\n"
         "step0010グループ別Excelの各列幅を自動調整します。\n"
+        "step0010グループ別年間TSVとstep0001日別稼動判定TSVから稼動日数行を追加した\n"
+        "step0011グループ別年間TSVを出力します。\n"
         "step0001のO列「処理日」から年別の日別稼動判定TSVを追加出力します。\n"
         "1行目は対象年（例：2026年）と半角数字の1～12月、2行目は稼動日数、3～33行目は1～31日の0／1です。\n"
         "未提供月は空欄、存在しない日は0です。判定TSVはUTF-8 BOM付きです。\n"

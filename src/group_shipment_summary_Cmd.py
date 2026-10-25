@@ -15959,6 +15959,100 @@ def create_step0015_group_deduction_files(
         raise
 
 
+def parse_step0010_group_file_name(pszInputPath: str) -> Tuple[str, int]:
+    objMatch = re.fullmatch(
+        r"(.+)_step0010_グループ別_(\d{4})_年間(?:_\d{2})?\.tsv",
+        os.path.basename(pszInputPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0010_GROUP_FILENAME",
+            "unexpected step0010 group file name. Path = " + pszInputPath,
+        )
+    return objMatch.group(1), int(objMatch.group(2))
+
+
+def create_step0011_group_output_path(pszStep0010Path: str) -> str:
+    pszDirectory = os.path.dirname(pszStep0010Path)
+    pszOutputName = re.sub(
+        r"_step0010_", "_step0011_", os.path.basename(pszStep0010Path), count=1
+    )
+    pszStem, pszExtension = os.path.splitext(pszOutputName)
+    pszOutputPath = os.path.join(pszDirectory, pszOutputName)
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszStem}_{iSuffix:02d}{pszExtension}"
+        )
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0011_group_files(
+    arrStep0010Paths: List[str], arrDailyOperationPaths: List[str]
+) -> List[str]:
+    """step0010グループ別年間TSVに稼動日数行を加え、step0011を作成します。"""
+    dicDailyPaths: Dict[Tuple[str, str, int], str] = {}
+    for pszDailyPath in arrDailyOperationPaths:
+        pszPrefix, iYear = parse_daily_operation_file_name(pszDailyPath)
+        objKey = (os.path.dirname(os.path.abspath(pszDailyPath)), pszPrefix, iYear)
+        if objKey in dicDailyPaths:
+            raise_conversion_error(
+                "DUPLICATE_STEP0011_DAILY_OPERATION_INPUT",
+                "duplicate daily operation input. Path = " + pszDailyPath,
+            )
+        dicDailyPaths[objKey] = pszDailyPath
+
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0010Path in arrStep0010Paths:
+            pszPrefix, iYear = parse_step0010_group_file_name(pszStep0010Path)
+            objKey = (
+                os.path.dirname(os.path.abspath(pszStep0010Path)), pszPrefix, iYear
+            )
+            pszDailyPath = dicDailyPaths.get(objKey)
+            if pszDailyPath is None:
+                raise_conversion_error(
+                    "MISSING_STEP0011_DAILY_OPERATION_INPUT",
+                    "matching daily operation TSV was not found for step0010. Path = "
+                    + pszStep0010Path,
+                )
+            arrRows = read_step0010_for_excel(pszStep0010Path)
+            arrDayCounts = read_daily_operation_row_for_step0015(
+                pszDailyPath, pszPrefix, iYear
+            )
+            arrRows.append(["", "稼動日数"] + arrDayCounts + [""])
+            pszOutputPath = create_step0011_group_output_path(pszStep0010Path)
+            try:
+                write_monthly_tsv(
+                    pszOutputPath,
+                    "\t".join(arrRows[0]),
+                    ["\t".join(arrRow) for arrRow in arrRows[1:]],
+                )
+            except ConversionError as objException:
+                raise_conversion_error(
+                    "STEP0011_GROUP_WRITE_FAILED", str(objException)
+                )
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0011_GROUP_CLEANUP_FAILED",
+                "step0011 creation failed. Original error = "
+                + str(objException)
+                + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 def convert_excel_to_tsv(pszOutputTsvPath: str, pszInputExcelPath: str) -> Tuple[int, int]:
     try:
         objFormulaWorkbook = load_workbook(
@@ -16440,6 +16534,9 @@ def main() -> int:
         arrStep0009Paths = create_step0009_files(arrStep0008Paths)
         arrStep0009ExcelPaths: List[str] = []
         arrStep0010Paths = create_step0010_files(arrStep0009Paths)
+        arrStep0011GroupPaths = create_step0011_group_files(
+            arrStep0010Paths, arrDailyOperationPaths
+        )
         arrStep0010ExcelPaths = create_step0010_excel_files(arrStep0010Paths)
     except Exception as objException:
         pszErrorCode: str = getattr(
@@ -16447,7 +16544,7 @@ def main() -> int:
         )
         pszErrorDetail: str = str(objException)
         print(
-            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 and step0010 annual TSVs or step0010 Excel files, create variety deduction step0009 and step0010 annual TSVs or step0010 Excel files, add annual totals, or create step0014 group deduction annual TSV or Excel files or step0015 group deduction annual TSV files. Detail = "
+            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 and step0010 annual TSVs or step0010 Excel files, create variety deduction step0009 and step0010 annual TSVs or step0010 Excel files, add annual totals, or create step0011 group annual TSV, step0014 group deduction annual TSV or Excel files, or step0015 group deduction annual TSV files. Detail = "
             + pszErrorDetail,
             file=sys.stderr,
         )
@@ -16731,10 +16828,11 @@ def main() -> int:
     print("step0010ファイル数: " + str(len(arrStep0010Paths)))
     print("step0010 Excel入力ファイル数: " + str(len(arrStep0010Paths)))
     print("step0010 Excelファイル数: " + str(len(arrStep0010ExcelPaths)))
+    print("step0011グループ別年間ファイル数: " + str(len(arrStep0011GroupPaths)))
     print("警告件数: " + str(iWarningCount))
     if pszWarningPath:
         print("警告ファイル: " + pszWarningPath)
-    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0010年間Excel作成・step0013グループ別控除廃棄年間TSV・step0014グループ別控除廃棄年間Excel・step0015グループ別控除廃棄年間TSV作成完了 ◇")
+    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0010年間Excel作成・step0011グループ別年間TSV・step0013グループ別控除廃棄年間TSV・step0014グループ別控除廃棄年間Excel・step0015グループ別控除廃棄年間TSV作成完了 ◇")
     print("入力Excel: " + pszInputExcelPath)
     print("出力フォルダ: " + os.path.dirname(pszOutputTsvPath))
     return 0
