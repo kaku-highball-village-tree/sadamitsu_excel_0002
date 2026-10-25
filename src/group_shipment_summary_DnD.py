@@ -1,6 +1,3 @@
-Warning: truncated output (original token count: 6002)
-Total output lines: 350
-
 # -*- coding: utf-8 -*-
 """Excelの「詳細データ」シートをTSVにするWindows DnD画面です。"""
 
@@ -212,7 +209,7 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "警告内容を記載したwarningファイルを作成します。\n"
         "step0002品種別ファイル名には「品種別」を含めます。\n"
         "品種別ファイル名には対象の年と月を含めます。\n"
-        "品種…2 tokens truncated…イル名の例：詳細データA_step0002_品種別_2026_07.tsv\n"
+        "品種別ファイル名の例：詳細データA_step0002_品種別_2026_07.tsv\n"
         "step0002総計ファイルも月ごとに作成します。\n"
         "step0002総計ファイル名には対象の年と月を含めます。\n"
         "品種別・総計の集計対象はそれぞれ同じ月の明細です。\n"
