@@ -695,7 +695,7 @@ def create_daily_operation_files(arrMonthlyTsvPaths: List[str]) -> List[str]:
     arrCreatedPaths: List[str] = []
     for (pszDirectory, pszPrefix, iYear), dicMonths in sorted(dicInputs.items()):
         arrRows: List[List[str]] = [[""] * 13 for _ in range(33)]
-        arrRows[0] = ["日"] + [str(m).translate(str.maketrans("0123456789", "０１２３４５６７８９")) + "月" for m in range(1, 13)]
+        arrRows[0] = [f"{iYear}年"] + [f"{m}月" for m in range(1, 13)]
         arrRows[1][0] = "稼動日数"
         for iDay in range(1, 32):
             arrRows[1 + iDay][0] = str(iDay)
