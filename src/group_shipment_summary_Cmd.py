@@ -16177,9 +16177,19 @@ def create_step0016_group_deduction_files(arrStep0015Paths: List[str]) -> List[s
                     if (len(arrRows) < 2
                             or any(len(row) != 15 for row in arrRows)
                             or arrRows[0] != ["", "年"] + [str(iExpectedYear)] * 12 + [""]
-                            or arrRows[1] != ["", "月"] + [str(m) for m in range(1, 13)] + [""]):
+                            or arrRows[1][:2] != ["", "月"]
+                            or arrRows[1][14] != ""):
                         raise ValueError(
                             "年間表の列数・年月見出しが不正です（15列、O1・O2は空欄）。Path = "
+                            + pszPath
+                        )
+                    arrMonths = [
+                        int(pszMonth) if re.fullmatch(r"[0-9]+", pszMonth) else 0
+                        for pszMonth in arrRows[1][2:14]
+                    ]
+                    if arrMonths != list(range(1, 13)):
+                        raise ValueError(
+                            "年間表の月見出しが不正です（01～12または1～12の月順）。Path = "
                             + pszPath
                         )
                 arrTotalIndexes = [
