@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Excelの「詳細データ」シートをTSVファイルへ変換します。"""
 
+import calendar
+import csv
 import os
 import re
 import sys
@@ -650,6 +652,106 @@ def split_tsv_by_month(
             )
         raise
     return arrCreatedPaths, arrYearMonths[0], arrYearMonths[-1]
+
+
+def create_daily_operation_files(arrMonthlyTsvPaths: List[str]) -> List[str]:
+    """step0001の処理日から、年別の95行×13列の稼動判定表を作成します。
+
+    最終年月より後の月は未提供として空欄にします。それ以前の不足月や
+    入力不備がある年は出力せず、正常な年を出力した後にエラーを報告します。
+    """
+    dicInputs: Dict[Tuple[str, str, int], Dict[int, str]] = {}
+    arrErrors: List[str] = []
+    for pszPath in arrMonthlyTsvPaths:
+        objMatch = re.fullmatch(
+            r"(.+)_step0001_([0-9]{4})_([0-9]{2})(?:_[0-9]+)?\.tsv",
+            os.path.basename(pszPath),
+        )
+        if objMatch is None:
+            raise_conversion_error("DAILY_INVALID_FILE_NAME", "Path = " + pszPath)
+        pszPrefix, pszYear, pszMonth = objMatch.groups()
+        iYear, iMonth = int(pszYear), int(pszMonth)
+        if not 1 <= iYear <= 9999 or not 1 <= iMonth <= 12:
+            raise_conversion_error("DAILY_INVALID_YEAR_MONTH", "Path = " + pszPath)
+        objKey = (os.path.dirname(os.path.abspath(pszPath)), pszPrefix, iYear)
+        dicMonths = dicInputs.setdefault(objKey, {})
+        if iMonth in dicMonths:
+            raise_conversion_error("DAILY_DUPLICATE_MONTH", "Path = " + pszPath)
+        dicMonths[iMonth] = pszPath
+
+    dicLastMonths: Dict[Tuple[str, str], Tuple[int, int]] = {}
+    for (pszDirectory, pszPrefix, iYear), dicMonths in dicInputs.items():
+        objSeries = (pszDirectory, pszPrefix)
+        dicLastMonths[objSeries] = max(
+            dicLastMonths.get(objSeries, (0, 0)), (iYear, max(dicMonths))
+        )
+
+    # 年自体が抜けている場合も、不足として検出します。
+    for objSeries, (iLastYear, _) in dicLastMonths.items():
+        iFirstYear = min(k[2] for k in dicInputs if k[:2] == objSeries)
+        for iYear in range(iFirstYear, iLastYear + 1):
+            dicInputs.setdefault((*objSeries, iYear), {})
+
+    arrCreatedPaths: List[str] = []
+    for (pszDirectory, pszPrefix, iYear), dicMonths in sorted(dicInputs.items()):
+        arrRows: List[List[str]] = [[""] * 13 for _ in range(95)]
+        arrRows[3] = ["日"] + [str(m).translate(str.maketrans("0123456789", "０１２３４５６７８９")) + "月" for m in range(1, 13)]
+        arrRows[63][0] = "稼動日数"
+        for iDay in range(1, 32):
+            arrRows[63 + iDay][0] = str(iDay)
+        iLastYear, iLastMonth = dicLastMonths[(pszDirectory, pszPrefix)]
+        iExpectedLastMonth = iLastMonth if iYear == iLastYear else 12
+        arrYearErrors: List[str] = []
+        for iMonth in range(1, iExpectedLastMonth + 1):
+            pszPath = dicMonths.get(iMonth)
+            if pszPath is None:
+                arrYearErrors.append(f"入力ファイル不足: {pszPrefix}_step0001_{iYear:04d}_{iMonth:02d}.tsv")
+                continue
+            try:
+                setDays = set()
+                with open(pszPath, "r", encoding="utf-8-sig", newline="") as objFile:
+                    objReader = csv.reader(objFile, delimiter="\t")
+                    arrHeader = next(objReader, [])
+                    if len(arrHeader) < 15 or arrHeader[14] != "処理日":
+                        raise ValueError("1行目: O列の見出しが「処理日」ではありません。")
+                    for arrFields in objReader:
+                        iLine = objReader.line_num
+                        pszDate = arrFields[14] if len(arrFields) >= 15 else ""
+                        if re.fullmatch(r"[0-9]{8}", pszDate) is None:
+                            raise ValueError(f"{iLine}行目: 不正な処理日 = {pszDate!r}")
+                        try:
+                            objDate = date(int(pszDate[:4]), int(pszDate[4:6]), int(pszDate[6:]))
+                        except ValueError:
+                            raise ValueError(f"{iLine}行目: 不正な処理日 = {pszDate!r}")
+                        if (objDate.year, objDate.month) != (iYear, iMonth):
+                            raise ValueError(f"{iLine}行目: ファイル名と処理日の年月が不一致 = {pszDate}")
+                        setDays.add(objDate.day)
+                iMonthDays = calendar.monthrange(iYear, iMonth)[1]
+                for iDay in range(1, 32):
+                    arrRows[63 + iDay][iMonth] = str(int(iDay <= iMonthDays and iDay in setDays))
+                arrRows[63][iMonth] = str(len(setDays))
+            except (OSError, UnicodeError, csv.Error, ValueError) as objException:
+                arrYearErrors.append(pszPath + ": " + str(objException))
+        if arrYearErrors:
+            arrErrors.extend(arrYearErrors)
+            continue
+
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszPrefix}_step0001_日別稼動判定_{iYear:04d}.tsv"
+        )
+        bReserved = False
+        try:
+            with open(pszOutputPath, "x", encoding="utf-8-sig", newline="") as objFile:
+                bReserved = True
+                csv.writer(objFile, delimiter="\t", lineterminator="\r\n").writerows(arrRows)
+            arrCreatedPaths.append(pszOutputPath)
+        except OSError as objException:
+            if bReserved:
+                os.remove(pszOutputPath)
+            arrErrors.append(pszOutputPath + ": " + str(objException))
+    if arrErrors:
+        raise_conversion_error("DAILY_OPERATION_FAILED", "\n".join(arrErrors))
+    return arrCreatedPaths
 
 
 def create_step0002_output_path(
@@ -15783,6 +15885,7 @@ def main() -> int:
             objFirstYearMonth,
             objLastYearMonth,
         ) = split_tsv_by_month(pszOutputTsvPath)
+        arrDailyOperationPaths = create_daily_operation_files(arrMonthlyTsvPaths)
         (
             arrVarietyTsvPaths,
             pszWarningPath,
@@ -16170,6 +16273,9 @@ def main() -> int:
 
     print("元TSV: " + pszOutputTsvPath)
     print("step0001ファイル数: " + str(len(arrMonthlyTsvPaths)))
+    print("日別稼動判定ファイル数: " + str(len(arrDailyOperationPaths)))
+    for pszPath in arrDailyOperationPaths:
+        print("日別稼動判定ファイル: " + pszPath)
     print("step0002品種別ファイル数: " + str(len(arrVarietyTsvPaths)))
     for pszPath in arrVarietyTsvPaths:
         print("step0002品種別ファイル: " + pszPath)
