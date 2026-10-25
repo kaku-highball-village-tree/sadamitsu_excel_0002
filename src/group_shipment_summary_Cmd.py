@@ -16132,6 +16132,85 @@ def create_step0012_group_files(arrStep0011Paths: List[str]) -> List[str]:
     return arrCreatedPaths
 
 
+def create_step0016_group_deduction_files(arrStep0015Paths: List[str]) -> List[str]:
+    """当年表に空行2行と前年合計6行を追加します。2022年は無変更コピーです。"""
+    dicInputs: Dict[Tuple[str, str, int], str] = {}
+    for pszPath in arrStep0015Paths:
+        objMatch = re.fullmatch(
+            r"(.+)_step0015_グループ別_控除廃棄_([0-9]{4})_年間(?:_[0-9]+)?\.tsv",
+            os.path.basename(pszPath),
+        )
+        if objMatch is None:
+            raise_conversion_error("STEP0016_GROUP_DEDUCTION_INVALID_NAME", "Path = " + pszPath)
+        pszPrefix, pszYear = objMatch.groups()
+        objKey = (os.path.dirname(os.path.abspath(pszPath)), pszPrefix, int(pszYear))
+        if objKey in dicInputs:
+            raise_conversion_error("STEP0016_GROUP_DEDUCTION_DUPLICATE_YEAR", "Path = " + pszPath)
+        dicInputs[objKey] = pszPath
+
+    arrCreatedPaths: List[str] = []
+    arrErrors: List[str] = []
+    for (pszDirectory, pszPrefix, iYear), pszInputPath in sorted(dicInputs.items()):
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszPrefix}_step0016_グループ別_控除廃棄_{iYear:04d}_年間.tsv"
+        )
+        bReserved = False
+        try:
+            with open(pszInputPath, "rb") as objFile:
+                objCurrent = objFile.read()
+            objOutput = objCurrent
+            if iYear != 2022:
+                pszPreviousPath = dicInputs.get(
+                    (pszDirectory, pszPrefix, iYear - 1),
+                    os.path.join(pszDirectory, f"{pszPrefix}_step0015_グループ別_控除廃棄_{iYear - 1:04d}_年間.tsv"),
+                )
+                with open(pszPreviousPath, "rb") as objFile:
+                    objPrevious = objFile.read()
+                arrCurrentLines = objCurrent.decode("utf-8-sig").splitlines()
+                arrPreviousLines = objPrevious.decode("utf-8-sig").splitlines()
+                arrCurrentRows = [line.split("\t") for line in arrCurrentLines]
+                arrPreviousRows = [line.split("\t") for line in arrPreviousLines]
+                for pszPath, arrRows in (
+                    (pszInputPath, arrCurrentRows), (pszPreviousPath, arrPreviousRows)
+                ):
+                    if (len(arrRows) < 2 or len(arrRows[0]) != 15
+                            or arrRows[0][:2] != ["", "年"]
+                            or arrRows[1] != ["", "月"] + [str(m) for m in range(1, 13)] + ["合計"]
+                            or any(len(row) != 15 for row in arrRows)):
+                        raise ValueError("年間表の列構成が不正です。Path = " + pszPath)
+                arrTotalIndexes = [
+                    i for i, row in enumerate(arrPreviousRows) if row[0] == "合計"
+                ]
+                if len(arrTotalIndexes) != 1:
+                    raise ValueError("前年の合計ブロックが不足または重複しています。Path = " + pszPreviousPath)
+                iStart = arrTotalIndexes[0]
+                arrTotals = [list(row) for row in arrPreviousRows[iStart:iStart + 6]]
+                arrItems = ["入雛羽数", "処理羽数", "処理重量", "平均体重", "育成率", "稼動日数"]
+                if (len(arrTotals) != 6 or [row[1] for row in arrTotals] != arrItems
+                        or any(row[0] for row in arrTotals[1:])
+                        or iStart + 6 != len(arrPreviousRows)):
+                    raise ValueError("前年の合計6行が不正です。Path = " + pszPreviousPath)
+                arrTotals[0][0] = "前年実績"
+                arrTotals[1][0] = f"{iYear - 1}年"
+                pszNewline = "\r\n" if b"\r\n" in objCurrent else ("\r" if b"\r" in objCurrent else "\n")
+                objNewline = pszNewline.encode("ascii")
+                # 元の内容を保持し、最終行との間に空行をちょうど2行設けます。
+                objOutput = objCurrent.rstrip(b"\r\n") + objNewline * 3
+                objOutput += (pszNewline.join("\t".join(row) for row in arrTotals) + pszNewline).encode("utf-8")
+            with open(pszOutputPath, "xb") as objFile:
+                bReserved = True
+                objFile.write(objOutput)
+            bReserved = False
+            arrCreatedPaths.append(pszOutputPath)
+        except (OSError, UnicodeError, ValueError) as objException:
+            if bReserved:
+                os.remove(pszOutputPath)
+            arrErrors.append(pszInputPath + ": " + str(objException))
+    if arrErrors:
+        raise_conversion_error("STEP0016_GROUP_DEDUCTION_FAILED", "\n".join(arrErrors))
+    return arrCreatedPaths
+
+
 def convert_excel_to_tsv(pszOutputTsvPath: str, pszInputExcelPath: str) -> Tuple[int, int]:
     try:
         objFormulaWorkbook = load_workbook(
@@ -16591,6 +16670,9 @@ def main() -> int:
                 arrStep0014GroupDeductionPaths, arrDailyOperationPaths
             )
         )
+        arrStep0016GroupDeductionPaths = create_step0016_group_deduction_files(
+            arrStep0015GroupDeductionPaths
+        )
         arrStep0005Paths, arrStep0005Years = create_step0005_files(
             pszOutputTsvPath, arrStep0004Paths, arrStep0004YearMonths
         )
@@ -16813,6 +16895,9 @@ def main() -> int:
         "step0015グループ別控除廃棄年間ファイル数: "
         + str(len(arrStep0015GroupDeductionPaths))
     )
+    print("step0016グループ別控除廃棄年間ファイル数: " + str(len(arrStep0016GroupDeductionPaths)))
+    for pszPath in arrStep0016GroupDeductionPaths:
+        print("step0016グループ別控除廃棄年間ファイル: " + pszPath)
     print(
         "step0005グループ別廃棄羽数ファイル数: "
         + str(len(arrStep0005GroupDiscardCountPaths))
