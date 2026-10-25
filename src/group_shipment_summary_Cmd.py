@@ -16170,14 +16170,18 @@ def create_step0016_group_deduction_files(arrStep0015Paths: List[str]) -> List[s
                 arrPreviousLines = objPrevious.decode("utf-8-sig").splitlines()
                 arrCurrentRows = [line.split("\t") for line in arrCurrentLines]
                 arrPreviousRows = [line.split("\t") for line in arrPreviousLines]
-                for pszPath, arrRows in (
-                    (pszInputPath, arrCurrentRows), (pszPreviousPath, arrPreviousRows)
+                for pszPath, arrRows, iExpectedYear in (
+                    (pszInputPath, arrCurrentRows, iYear),
+                    (pszPreviousPath, arrPreviousRows, iYear - 1),
                 ):
-                    if (len(arrRows) < 2 or len(arrRows[0]) != 15
-                            or arrRows[0][:2] != ["", "年"]
-                            or arrRows[1] != ["", "月"] + [str(m) for m in range(1, 13)] + ["合計"]
-                            or any(len(row) != 15 for row in arrRows)):
-                        raise ValueError("年間表の列構成が不正です。Path = " + pszPath)
+                    if (len(arrRows) < 2
+                            or any(len(row) != 15 for row in arrRows)
+                            or arrRows[0] != ["", "年"] + [str(iExpectedYear)] * 12 + [""]
+                            or arrRows[1] != ["", "月"] + [str(m) for m in range(1, 13)] + [""]):
+                        raise ValueError(
+                            "年間表の列数・年月見出しが不正です（15列、O1・O2は空欄）。Path = "
+                            + pszPath
+                        )
                 arrTotalIndexes = [
                     i for i, row in enumerate(arrPreviousRows) if row[0] == "合計"
                 ]
