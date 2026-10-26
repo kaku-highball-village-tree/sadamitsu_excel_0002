@@ -5,6 +5,7 @@ import calendar
 import csv
 import os
 import re
+import shutil
 import sys
 import tempfile
 import unicodedata
@@ -8542,6 +8543,57 @@ def create_step0012_discard_summary_excel_files(
                 "step0012 discard summary Excel creation failed. Original error = "
                 + str(objException) + "; cleanup errors = " + " | ".join(arrCleanupErrors),
             )
+        raise
+
+
+def create_discard_summary_monthly_named_copies(
+    arrExcelPaths: List[str],
+) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszExcelPath in arrExcelPaths:
+            objWorkbook = load_workbook(pszExcelPath, read_only=True, data_only=True)
+            try:
+                objWorksheet = objWorkbook.active
+                arrYearMonths: List[Tuple[int, int]] = []
+                for arrValues in objWorksheet.iter_rows(
+                    min_row=1, min_col=1, max_col=2, values_only=True
+                ):
+                    objYear, objMonth = arrValues
+                    try:
+                        iYear = int(objYear)
+                        iMonth = int(objMonth)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if 1900 <= iYear <= 9999 and 1 <= iMonth <= 12:
+                        arrYearMonths.append((iYear, iMonth))
+            finally:
+                objWorkbook.close()
+            if not arrYearMonths:
+                raise_conversion_error(
+                    "STEP0012_DISCARD_NAMED_COPY_DATE_MISSING",
+                    "no valid year/month was found in columns A and B. Path = "
+                    + pszExcelPath,
+                )
+            iYear, iMonth = max(arrYearMonths)
+            pszDirectory = os.path.dirname(pszExcelPath)
+            pszStem = f"〇廃棄データ月別一覧表～{iYear:04d}年{iMonth:02d}月"
+            pszOutputPath = os.path.join(pszDirectory, pszStem + ".xlsx")
+            iSuffix = 2
+            while os.path.exists(pszOutputPath):
+                pszOutputPath = os.path.join(
+                    pszDirectory, f"{pszStem}_{iSuffix:02d}.xlsx"
+                )
+                iSuffix += 1
+            shutil.copy2(pszExcelPath, pszOutputPath)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception:
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except OSError:
+                pass
         raise
 
 
@@ -17189,6 +17241,11 @@ def main() -> int:
                 arrStep0012DiscardSummaryPaths
             )
         )
+        arrNamedDiscardSummaryExcelPaths = (
+            create_discard_summary_monthly_named_copies(
+                arrStep0012DiscardSummaryExcelPaths
+            )
+        )
         arrStep0004Paths, arrStep0004YearMonths = create_step0004_files(
             pszOutputTsvPath, arrStep0003Paths, arrStep0003YearMonths
         )
@@ -17525,6 +17582,9 @@ def main() -> int:
         "step0012総計廃棄データ一覧表Excelファイル数: "
         + str(len(arrStep0012DiscardSummaryExcelPaths))
     )
+    print("年月付き廃棄データ一覧表Excelファイル数: " + str(len(arrNamedDiscardSummaryExcelPaths)))
+    for pszPath in arrNamedDiscardSummaryExcelPaths:
+        print("年月付き廃棄データ一覧表Excelファイル: " + pszPath)
     if arrStep0003YearMonths:
         print(
             "step0003最初の年月: "

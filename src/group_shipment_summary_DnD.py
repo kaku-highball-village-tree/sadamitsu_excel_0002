@@ -525,6 +525,8 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "step0012総計廃棄データ一覧表を出力します。\n"
         "step0012総計廃棄データ一覧表TSVからExcelファイルを出力し、\n"
         "各列の見出しとデータに合わせて列幅を自動調整します。\n"
+        "ExcelのA列・B列から最新年月を取得し、\n"
+        "〇廃棄データ月別一覧表～YYYY年MM月.xlsxの名前でもコピーを出力します。\n"
         "主要4項目をグループ別TSVへ結合し、\n"
         "年・グループ別の年間TSVへ連結し、\n"
         "年間TSVの行と列を入れ替え、\n"
