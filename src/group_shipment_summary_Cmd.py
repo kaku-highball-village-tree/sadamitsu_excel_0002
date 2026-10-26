@@ -15338,6 +15338,219 @@ def create_step0010_excel_files(
         raise
 
 
+STEP0013_GROUP_EXCEL_CURRENT_STRUCTURE: List[Tuple[str, str]] = [
+    ("", "年"), ("", "月")
+]
+for _, pszGroupName in GROUPS:
+    STEP0013_GROUP_EXCEL_CURRENT_STRUCTURE.extend(
+        [
+            (pszGroupName, "入雛羽数"),
+            ("", "出荷羽数"),
+            ("", "正味重量"),
+            ("", "平均体重"),
+            ("", "育成率"),
+        ]
+    )
+STEP0013_GROUP_EXCEL_CURRENT_STRUCTURE.extend(
+    [
+        ("合計", "入雛羽数"),
+        ("", "出荷羽数"),
+        ("", "正味重量"),
+        ("", "平均体重"),
+        ("", "育成率"),
+        ("", "稼動日数"),
+    ]
+)
+
+
+def read_step0013_group_for_excel(pszInputPath: str) -> List[List[str]]:
+    objFileNameMatch = re.search(
+        r"_step0013_グループ別_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objFileNameMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0013_GROUP_EXCEL_FILENAME",
+            "unexpected step0013 group file name. Path = " + pszInputPath,
+        )
+    iExpectedYear = int(objFileNameMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8-sig", newline="") as objFile:
+            arrRows = [strip_line_ending(pszLine).split("\t") for pszLine in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0013_GROUP_EXCEL_READ_FAILED",
+            "failed to read step0013 group TSV. Path = "
+            + pszInputPath + ", Detail = " + str(objException),
+        )
+
+    bHasPreviousYear = iExpectedYear != 2022
+    iExpectedRowCount = 31 if bHasPreviousYear else 23
+    if len(arrRows) != iExpectedRowCount:
+        raise_conversion_error(
+            "INVALID_STEP0013_GROUP_EXCEL_ROW_COUNT",
+            "step0013 group TSV must contain " + str(iExpectedRowCount)
+            + " rows. Path = " + pszInputPath,
+        )
+    if any(len(arrRow) != 15 for arrRow in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0013_GROUP_EXCEL_COLUMN_COUNT",
+            "step0013 group TSV rows must contain exactly 15 columns. Path = "
+            + pszInputPath,
+        )
+
+    for iRowIndex, objExpected in enumerate(STEP0013_GROUP_EXCEL_CURRENT_STRUCTURE):
+        objActual = tuple(
+            pszValue.strip(" \u3000\t") for pszValue in arrRows[iRowIndex][:2]
+        )
+        if objActual != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0013_GROUP_EXCEL_ROW_STRUCTURE",
+                "unexpected step0013 group row structure. Path = "
+                + pszInputPath + ", Line = " + str(iRowIndex + 1),
+            )
+
+    if arrRows[0][14] != "" or arrRows[1][14] != "合計":
+        raise_conversion_error(
+            "INVALID_STEP0013_GROUP_EXCEL_TOTAL_HEADER",
+            "step0013 group annual header is invalid. Path = " + pszInputPath,
+        )
+    for iColumnIndex in range(2, 14):
+        iYear, iMonth = parse_year_month(
+            arrRows[0][iColumnIndex], arrRows[1][iColumnIndex], iColumnIndex + 1
+        )
+        if iYear != iExpectedYear or iMonth != iColumnIndex - 1:
+            raise_conversion_error(
+                "INVALID_STEP0013_GROUP_EXCEL_YEAR_MONTH",
+                "step0013 group year or month did not match its file name or column. Path = "
+                + pszInputPath + ", Column = " + str(iColumnIndex + 1),
+            )
+
+    def validate_numeric_cell(iRowIndex: int, iColumnIndex: int, pszItemName: str,
+                              bAllowBlank: bool) -> None:
+        try:
+            objValue = parse_decimal_value(
+                arrRows[iRowIndex][iColumnIndex],
+                iRowIndex + 1,
+                iColumnIndex,
+                pszItemName,
+            )
+        except ConversionError as objException:
+            raise_conversion_error(
+                "INVALID_STEP0013_GROUP_EXCEL_ITEM_VALUE",
+                "invalid step0013 group value. Path = " + pszInputPath
+                + ", Line = " + str(iRowIndex + 1)
+                + ", Column = " + str(iColumnIndex + 1)
+                + ", Detail = " + str(objException),
+            )
+        if objValue is None and not bAllowBlank:
+            raise_conversion_error(
+                "INVALID_STEP0013_GROUP_EXCEL_ITEM_VALUE",
+                "step0013 group value was blank. Path = " + pszInputPath
+                + ", Line = " + str(iRowIndex + 1)
+                + ", Column = " + str(iColumnIndex + 1),
+            )
+        if (objValue is not None
+                and pszItemName in {"入雛羽数", "出荷羽数", "稼動日数"}
+                and objValue != objValue.to_integral_value()):
+            raise_conversion_error(
+                "INVALID_STEP0013_GROUP_EXCEL_COUNT_VALUE",
+                "step0013 group counts must be integers. Path = " + pszInputPath
+                + ", Line = " + str(iRowIndex + 1)
+                + ", Column = " + str(iColumnIndex + 1),
+            )
+
+    for iRowIndex in range(2, 23):
+        pszItemName = STEP0013_GROUP_EXCEL_CURRENT_STRUCTURE[iRowIndex][1]
+        for iColumnIndex in range(2, 15):
+            validate_numeric_cell(
+                iRowIndex,
+                iColumnIndex,
+                pszItemName,
+                pszItemName in {"平均体重", "育成率"} and iColumnIndex < 14,
+            )
+
+    if bHasPreviousYear:
+        if (arrRows[23][:2] != ["出荷羽数", "前年比"]
+                or arrRows[24][:2] != ["", "(一日平均)"]
+                or any(arrRows[24][2:])):
+            raise_conversion_error(
+                "INVALID_STEP0013_GROUP_EXCEL_RATIO_ROW",
+                "step0013 group ratio rows are invalid. Path = " + pszInputPath,
+            )
+        for iColumnIndex in range(2, 15):
+            validate_numeric_cell(23, iColumnIndex, "前年比", True)
+        arrPreviousStructure = [
+            ("前年実績", "入雛羽数"),
+            (f"{iExpectedYear - 1}年", "出荷羽数"),
+            ("", "正味重量"),
+            ("", "平均体重"),
+            ("", "育成率"),
+            ("", "稼動日数"),
+        ]
+        for iOffset, objExpected in enumerate(arrPreviousStructure):
+            iRowIndex = 25 + iOffset
+            objActual = tuple(
+                pszValue.strip(" \u3000\t") for pszValue in arrRows[iRowIndex][:2]
+            )
+            if objActual != objExpected:
+                raise_conversion_error(
+                    "INVALID_STEP0013_GROUP_EXCEL_PREVIOUS_STRUCTURE",
+                    "step0013 group previous-year row structure is invalid. Path = "
+                    + pszInputPath + ", Line = " + str(iRowIndex + 1),
+                )
+            pszItemName = objExpected[1]
+            for iColumnIndex in range(2, 15):
+                validate_numeric_cell(
+                    iRowIndex,
+                    iColumnIndex,
+                    pszItemName,
+                    pszItemName in {"平均体重", "育成率"} and iColumnIndex < 14,
+                )
+    return arrRows
+
+
+def create_step0013_group_excel_output_path(pszStep0013TsvPath: str) -> str:
+    pszDirectory = os.path.dirname(pszStep0013TsvPath)
+    pszStem = os.path.splitext(os.path.basename(pszStep0013TsvPath))[0]
+    pszOutputPath = os.path.join(pszDirectory, pszStem + ".xlsx")
+    iSuffix = 2
+    while os.path.exists(pszOutputPath):
+        pszOutputPath = os.path.join(pszDirectory, f"{pszStem}_{iSuffix:02d}.xlsx")
+        iSuffix += 1
+    return pszOutputPath
+
+
+def create_step0013_group_excel_files(
+    arrStep0013TsvPaths: List[str],
+) -> List[str]:
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0013TsvPath in arrStep0013TsvPaths:
+            arrRows = read_step0013_group_for_excel(pszStep0013TsvPath)
+            pszOutputPath = create_step0013_group_excel_output_path(
+                pszStep0013TsvPath
+            )
+            write_group_deduction_excel(pszOutputPath, arrRows, 13)
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0013_GROUP_EXCEL_CLEANUP_FAILED",
+                "step0013 group Excel creation failed. Original error = "
+                + str(objException) + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 STEP0013_EXCEL_ROW_STRUCTURE: List[Tuple[str, str]] = [("", "年"), ("", "月")]
 for _, pszGroupName in GROUPS:
     STEP0013_EXCEL_ROW_STRUCTURE.extend(
@@ -15505,6 +15718,9 @@ def write_group_deduction_excel(
                     if iColumnIndex <= 2:
                         objCell.value = pszValue if pszValue != "" else None
                         continue
+                    if iRowIndex == 2 and iColumnIndex == 15 and pszValue == "合計":
+                        objCell.value = pszValue
+                        continue
                     pszNormalizedValue = pszValue.strip(" \u3000\t")
                     if pszNormalizedValue == "":
                         continue
@@ -15514,16 +15730,20 @@ def write_group_deduction_excel(
                         if objValue == objValue.to_integral_value()
                         else float(objValue)
                     )
-                    if pszItemName in {"年", "月", "入雛羽数", "処理羽数"}:
+                    if pszItemName in {"年", "月", "入雛羽数", "出荷羽数", "処理羽数", "稼動日数"}:
                         objCell.number_format = "0"
-                    elif pszItemName == "処理重量":
+                    elif pszItemName in {"正味重量", "処理重量"}:
                         iDecimalPlaces = max(0, -objValue.as_tuple().exponent)
                         objCell.number_format = (
                             "0." + "#" * iDecimalPlaces if iDecimalPlaces else "0"
                         )
                     elif pszItemName == "平均体重":
-                        objCell.number_format = "0.000"
+                        iDecimalPlaces = max(3, -objValue.as_tuple().exponent)
+                        objCell.number_format = "0." + "#" * iDecimalPlaces
                     elif pszItemName == "育成率":
+                        iDecimalPlaces = max(4, -objValue.as_tuple().exponent)
+                        objCell.number_format = "0." + "#" * iDecimalPlaces
+                    elif pszItemName == "前年比":
                         objCell.number_format = "0.0000"
             for iColumnIndex in range(1, objWorksheet.max_column + 1):
                 iMaximumDisplayWidth = 0
@@ -16905,14 +17125,16 @@ def main() -> int:
         )
         arrStep0012GroupPaths = create_step0012_group_files(arrStep0011GroupPaths)
         arrStep0013GroupPaths = create_step0013_group_files(arrStep0012GroupPaths)
-        arrStep0010ExcelPaths = create_step0010_excel_files(arrStep0010Paths)
+        arrStep0013GroupExcelPaths = create_step0013_group_excel_files(
+            arrStep0013GroupPaths
+        )
     except Exception as objException:
         pszErrorCode: str = getattr(
             objException, "pszErrorCode", "UNEXPECTED_CONVERSION_ERROR"
         )
         pszErrorDetail: str = str(objException)
         print(
-            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 and step0010 annual TSVs or step0010 Excel files, create variety deduction step0009 and step0010 annual TSVs or step0010 Excel files, add annual totals, or create step0011 group annual TSV, step0014 group deduction annual TSV or Excel files, or step0015 group deduction annual TSV files. Detail = "
+            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 and step0010 annual TSVs or step0010 Excel files, create variety deduction step0009 and step0010 annual TSVs or step0010 Excel files, add annual totals, or create step0011 and step0013 group annual TSV or Excel files, step0014 group deduction annual TSV or Excel files, or step0015 group deduction annual TSV files. Detail = "
             + pszErrorDetail,
             file=sys.stderr,
         )
@@ -17200,8 +17422,10 @@ def main() -> int:
     print("step0009グループ別Excelは作成しません。")
     print("step0010入力ファイル数: " + str(len(arrStep0009Paths)))
     print("step0010ファイル数: " + str(len(arrStep0010Paths)))
-    print("step0010 Excel入力ファイル数: " + str(len(arrStep0010Paths)))
-    print("step0010 Excelファイル数: " + str(len(arrStep0010ExcelPaths)))
+    print("step0013グループ別Excel入力ファイル数: " + str(len(arrStep0013GroupPaths)))
+    print("step0013グループ別Excelファイル数: " + str(len(arrStep0013GroupExcelPaths)))
+    for pszPath in arrStep0013GroupExcelPaths:
+        print("step0013グループ別Excelファイル: " + pszPath)
     print("step0011グループ別年間ファイル数: " + str(len(arrStep0011GroupPaths)))
     print("step0013グループ別年間ファイル数: " + str(len(arrStep0013GroupPaths)))
     for pszPath in arrStep0013GroupPaths:
@@ -17212,7 +17436,7 @@ def main() -> int:
     print("警告件数: " + str(iWarningCount))
     if pszWarningPath:
         print("警告ファイル: " + pszWarningPath)
-    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0010年間Excel作成・step0011グループ別年間TSV・step0013グループ別控除廃棄年間TSV・step0014グループ別控除廃棄年間Excel・step0015グループ別控除廃棄年間TSV作成完了 ◇")
+    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0013グループ別年間Excel作成・step0011・step0013グループ別年間TSV・step0013グループ別控除廃棄年間TSV・step0014グループ別控除廃棄年間Excel・step0015グループ別控除廃棄年間TSV作成完了 ◇")
     print("入力Excel: " + pszInputExcelPath)
     print("出力フォルダ: " + os.path.dirname(pszOutputTsvPath))
     return 0
