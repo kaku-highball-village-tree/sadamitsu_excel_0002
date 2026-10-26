@@ -16839,52 +16839,101 @@ def create_step0017_group_deduction_files(arrStep0016Paths: List[str]) -> List[s
 
 
 def create_step0013_group_files(arrStep0012Paths: List[str]) -> List[str]:
-    """step0012の空行2行を一日平均出荷羽数の前年比に置き換えます。"""
+    """当年・前年のstep0012から一日平均出荷羽数の前年比を作成します。"""
+    dicInputs: Dict[Tuple[str, str, int], str] = {}
+    for pszPath in arrStep0012Paths:
+        objMatch = re.fullmatch(
+            r"(.+)_step0012_グループ別_([0-9]{4})_年間(?:_[0-9]+)?\.tsv",
+            os.path.basename(pszPath),
+        )
+        if objMatch is None:
+            raise_conversion_error(
+                "STEP0013_GROUP_INVALID_NAME", "step0012のファイル名が不正です。Path = " + pszPath
+            )
+        pszPrefix, pszYear = objMatch.groups()
+        objKey = (os.path.dirname(os.path.abspath(pszPath)), pszPrefix, int(pszYear))
+        if objKey in dicInputs:
+            raise_conversion_error(
+                "STEP0013_GROUP_DUPLICATE_YEAR", "step0012の対象年が重複しています。Path = " + pszPath
+            )
+        dicInputs[objKey] = pszPath
+
     arrCreatedPaths: List[str] = []
     arrErrors: List[str] = []
-    for pszInputPath in arrStep0012Paths:
+    for (pszDirectory, pszPrefix, iYear), pszInputPath in sorted(dicInputs.items()):
         bReserved = False
-        pszOutputPath = ""
+        pszOutputPath = os.path.join(
+            pszDirectory, f"{pszPrefix}_step0013_グループ別_{iYear:04d}_年間.tsv"
+        )
         try:
-            objMatch = re.fullmatch(
-                r"(.+)_step0012_グループ別_([0-9]{4})_年間(?:_[0-9]+)?\.tsv",
-                os.path.basename(pszInputPath),
-            )
-            if objMatch is None:
-                raise ValueError("step0012のファイル名が不正です。")
-            pszPrefix, pszYear = objMatch.groups()
-            iYear = int(pszYear)
-            pszOutputPath = os.path.join(
-                os.path.dirname(pszInputPath),
-                f"{pszPrefix}_step0013_グループ別_{iYear:04d}_年間.tsv",
-            )
             with open(pszInputPath, "rb") as objFile:
                 objInput = objFile.read()
             objOutput = objInput
             if iYear != 2022:
+                pszPreviousPath = dicInputs.get(
+                    (pszDirectory, pszPrefix, iYear - 1),
+                    os.path.join(
+                        pszDirectory,
+                        f"{pszPrefix}_step0012_グループ別_{iYear - 1:04d}_年間.tsv",
+                    ),
+                )
+                with open(pszPreviousPath, "rb") as objFile:
+                    objPrevious = objFile.read()
                 arrLines = objInput.splitlines(keepends=True)
-                arrRows = [line.split("\t") for line in objInput.decode("utf-8-sig").splitlines()]
-                if (len(arrRows) != 31
-                        or any(len(row) != 15 for i, row in enumerate(arrRows) if i not in (23, 24))):
-                    raise ValueError("step0012は31行で、空行以外は15列である必要があります。")
-                if any(value for i in (23, 24) for value in arrRows[i]):
-                    raise ValueError("24・25行目は空行である必要があります。")
-                if (arrRows[0] != ["", "年"] + [str(iYear)] * 12 + [""]
-                        or arrRows[1][:2] != ["", "月"] or arrRows[1][14] != "合計"
-                        or any(re.fullmatch(r"[0-9]+", v) is None for v in arrRows[1][2:14])
-                        or [int(v) for v in arrRows[1][2:14]] != list(range(1, 13))):
-                    raise ValueError("step0012の年月見出しが不正です。")
+                arrInputRows = [
+                    line.split("\t") for line in objInput.decode("utf-8-sig").splitlines()
+                ]
+                arrPreviousRows = [
+                    line.split("\t") for line in objPrevious.decode("utf-8-sig").splitlines()
+                ]
+                for pszPath, arrRows, iExpectedYear in (
+                    (pszInputPath, arrInputRows, iYear),
+                    (pszPreviousPath, arrPreviousRows, iYear - 1),
+                ):
+                    iExpectedRowCount = 23 if iExpectedYear == 2022 else 31
+                    if (len(arrRows) != iExpectedRowCount
+                            or any(
+                                len(row) != 15
+                                for i, row in enumerate(arrRows)
+                                if i not in (23, 24) or iExpectedYear == 2022
+                            )):
+                        raise ValueError(
+                            "step0012の行数・列数が不正です（2022年は23行、その他は31行）。Path = "
+                            + pszPath
+                        )
+                    if (arrRows[0] != ["", "年"] + [str(iExpectedYear)] * 12 + [""]
+                            or arrRows[1][:2] != ["", "月"]
+                            or arrRows[1][14] != "合計"
+                            or any(re.fullmatch(r"[0-9]+", v) is None for v in arrRows[1][2:14])
+                            or [int(v) for v in arrRows[1][2:14]] != list(range(1, 13))):
+                        raise ValueError("step0012の年月見出しが不正です。Path = " + pszPath)
+                    if (iExpectedYear != 2022
+                            and any(value for i in (23, 24) for value in arrRows[i])):
+                        raise ValueError("24・25行目は空行である必要があります。Path = " + pszPath)
                 arrItems = ["入雛羽数", "出荷羽数", "正味重量", "平均体重", "育成率", "稼動日数"]
-                if (arrRows[17][:2] != ["合計", "入雛羽数"]
-                        or [row[1] for row in arrRows[17:23]] != arrItems
-                        or [row[1] for row in arrRows[25:31]] != arrItems
-                        or arrRows[25][0] != "前年実績"
-                        or arrRows[26][0] != f"{iYear - 1}年"):
-                    raise ValueError("当年・前年の合計項目または前年表示が不正です。")
+                for pszPath, arrRows in (
+                    (pszInputPath, arrInputRows), (pszPreviousPath, arrPreviousRows)
+                ):
+                    if (arrRows[17][:2] != ["合計", "入雛羽数"]
+                            or [row[1] for row in arrRows[17:23]] != arrItems):
+                        raise ValueError("合計ブロックの項目構成が不正です。Path = " + pszPath)
+                if (iYear != 2022
+                        and ([row[1] for row in arrInputRows[25:31]] != arrItems
+                             or arrInputRows[25][0] != "前年実績"
+                             or arrInputRows[26][0] != f"{iYear - 1}年")):
+                    raise ValueError(
+                        "当年step0012の前年実績ブロックが不正です。Path = " + pszInputPath
+                    )
                 arrRatios: List[str] = []
                 for iColumn in range(2, 15):
                     try:
-                        arrValues = [Decimal(arrRows[iRow][iColumn] or "0") for iRow in (18, 22, 26, 30)]
+                        arrValues = [
+                            Decimal(arrRows[iRow][iColumn] or "0")
+                            for arrRows, iRow in (
+                                (arrInputRows, 18), (arrInputRows, 22),
+                                (arrPreviousRows, 18), (arrPreviousRows, 22),
+                            )
+                        ]
                         if any(not value.is_finite() for value in arrValues):
                             raise ValueError("non-finite value")
                         objCurrent, objCurrentDays, objPrevious, objPreviousDays = arrValues
