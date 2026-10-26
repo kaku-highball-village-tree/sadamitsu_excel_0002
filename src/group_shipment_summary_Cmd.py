@@ -15993,6 +15993,150 @@ def create_step0014_group_deduction_excel_files(
         raise
 
 
+STEP0017_GROUP_DEDUCTION_EXCEL_STRUCTURE: List[Tuple[str, str]] = [
+    ("", "年"), ("", "月")
+]
+for _, pszGroupName in GROUPS:
+    STEP0017_GROUP_DEDUCTION_EXCEL_STRUCTURE.extend(
+        [(pszGroupName, "入雛羽数"), ("", "処理羽数"), ("", "処理重量"),
+         ("", "平均体重"), ("", "育成率")]
+    )
+STEP0017_GROUP_DEDUCTION_EXCEL_STRUCTURE.extend(
+    [("合計", "入雛羽数"), ("", "処理羽数"), ("", "処理重量"),
+     ("", "平均体重"), ("", "育成率"), ("", "稼動日数")]
+)
+
+
+def read_step0017_group_deduction_for_excel(
+    pszInputPath: str,
+) -> List[List[str]]:
+    objMatch = re.search(
+        r"_step0017_グループ別_控除廃棄_(\d{4})_年間(?:_\d{2})?\.tsv$",
+        os.path.basename(pszInputPath),
+    )
+    if objMatch is None:
+        raise_conversion_error(
+            "INVALID_STEP0017_EXCEL_FILENAME",
+            "unexpected step0017 group deduction file name. Path = " + pszInputPath,
+        )
+    iYear = int(objMatch.group(1))
+    try:
+        with open(pszInputPath, "r", encoding="utf-8-sig", newline="") as objFile:
+            arrRows = [strip_line_ending(line).split("\t") for line in objFile]
+    except Exception as objException:
+        raise_conversion_error(
+            "STEP0017_EXCEL_READ_FAILED",
+            "failed to read step0017 TSV. Path = " + pszInputPath
+            + ", Detail = " + str(objException),
+        )
+    bHasPrevious = iYear != 2022
+    iExpectedRows = 31 if bHasPrevious else 23
+    if len(arrRows) != iExpectedRows or any(len(row) != 15 for row in arrRows):
+        raise_conversion_error(
+            "INVALID_STEP0017_EXCEL_DIMENSIONS",
+            "step0017 TSV must contain " + str(iExpectedRows)
+            + " rows and 15 columns. Path = " + pszInputPath,
+        )
+    for i, objExpected in enumerate(STEP0017_GROUP_DEDUCTION_EXCEL_STRUCTURE):
+        if tuple(value.strip(" \u3000\t") for value in arrRows[i][:2]) != objExpected:
+            raise_conversion_error(
+                "INVALID_STEP0017_EXCEL_ROW_STRUCTURE",
+                "unexpected step0017 row structure. Path = " + pszInputPath
+                + ", Line = " + str(i + 1),
+            )
+    if arrRows[0][14].strip() or arrRows[1][14].strip():
+        raise_conversion_error(
+            "INVALID_STEP0017_EXCEL_ANNUAL_HEADER",
+            "step0017 annual headers must be blank. Path = " + pszInputPath,
+        )
+    for month_index in range(12):
+        col = month_index + 2
+        year, month = parse_year_month(arrRows[0][col], arrRows[1][col], col + 1)
+        if year != iYear or month != month_index + 1:
+            raise_conversion_error(
+                "INVALID_STEP0017_EXCEL_YEAR_MONTH",
+                "step0017 year/month header is invalid. Path = " + pszInputPath,
+            )
+
+    def validate_value(row_index: int, col: int, item: str, allow_blank: bool) -> None:
+        try:
+            value = parse_decimal_value(arrRows[row_index][col], row_index + 1, col, item)
+        except ConversionError as exc:
+            raise_conversion_error("INVALID_STEP0017_EXCEL_VALUE", str(exc))
+        if value is None and not allow_blank:
+            raise_conversion_error(
+                "INVALID_STEP0017_EXCEL_VALUE",
+                "step0017 required value was blank. Path = " + pszInputPath
+                + ", Line = " + str(row_index + 1) + ", Column = " + str(col + 1),
+            )
+        if value is not None and item in {"入雛羽数", "処理羽数", "稼動日数"}:
+            if value != value.to_integral_value():
+                raise_conversion_error(
+                    "INVALID_STEP0017_EXCEL_COUNT",
+                    "step0017 count must be an integer. Path = " + pszInputPath,
+                )
+
+    for row_index in range(2, 23):
+        item = STEP0017_GROUP_DEDUCTION_EXCEL_STRUCTURE[row_index][1]
+        for col in range(2, 15):
+            validate_value(
+                row_index, col, item,
+                item in {"平均体重", "育成率", "稼動日数"} and col < 14,
+            )
+    if bHasPrevious:
+        if (arrRows[23][:2] != ["処理羽数", "前年比"]
+                or arrRows[24][:2] != ["", "(一日平均)"]
+                or any(arrRows[24][2:])):
+            raise_conversion_error(
+                "INVALID_STEP0017_EXCEL_RATIO_ROW",
+                "step0017 ratio rows are invalid. Path = " + pszInputPath,
+            )
+        for col in range(2, 15):
+            validate_value(23, col, "前年比", True)
+        previous = [("前年実績", "入雛羽数"), (f"{iYear - 1}年", "処理羽数"),
+                    ("", "処理重量"), ("", "平均体重"), ("", "育成率"),
+                    ("", "稼動日数")]
+        for offset, expected in enumerate(previous):
+            row_index = 25 + offset
+            if tuple(v.strip(" \u3000\t") for v in arrRows[row_index][:2]) != expected:
+                raise_conversion_error(
+                    "INVALID_STEP0017_EXCEL_PREVIOUS_STRUCTURE",
+                    "step0017 previous-year rows are invalid. Path = " + pszInputPath,
+                )
+            for col in range(2, 15):
+                validate_value(
+                    row_index, col, expected[1],
+                    expected[1] in {"平均体重", "育成率", "稼動日数"} and col < 14,
+                )
+    return arrRows
+
+
+def create_step0017_group_deduction_excel_files(
+    arrTsvPaths: List[str],
+) -> List[str]:
+    arrCreated: List[str] = []
+    try:
+        for tsv_path in arrTsvPaths:
+            rows = read_step0017_group_deduction_for_excel(tsv_path)
+            directory = os.path.dirname(tsv_path)
+            stem = os.path.splitext(os.path.basename(tsv_path))[0]
+            output = os.path.join(directory, stem + ".xlsx")
+            suffix = 2
+            while os.path.exists(output):
+                output = os.path.join(directory, f"{stem}_{suffix:02d}.xlsx")
+                suffix += 1
+            write_group_deduction_excel(output, rows, 17)
+            arrCreated.append(output)
+        return arrCreated
+    except Exception:
+        for path in arrCreated:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise
+
+
 def parse_step0014_group_deduction_file_name(
     pszInputPath: str,
 ) -> Tuple[str, int]:
@@ -17084,11 +17228,7 @@ def main() -> int:
                 arrStep0013GroupDeductionPaths
             )
         )
-        arrStep0014GroupDeductionExcelPaths = (
-            create_step0014_group_deduction_excel_files(
-                arrStep0014GroupDeductionPaths
-            )
-        )
+        arrStep0014GroupDeductionExcelPaths: List[str] = []
         arrStep0015GroupDeductionPaths = (
             create_step0015_group_deduction_files(
                 arrStep0014GroupDeductionPaths, arrDailyOperationPaths
@@ -17099,6 +17239,11 @@ def main() -> int:
         )
         arrStep0017GroupDeductionPaths = create_step0017_group_deduction_files(
             arrStep0016GroupDeductionPaths
+        )
+        arrStep0017GroupDeductionExcelPaths = (
+            create_step0017_group_deduction_excel_files(
+                arrStep0017GroupDeductionPaths
+            )
         )
         arrStep0005Paths, arrStep0005Years = create_step0005_files(
             pszOutputTsvPath, arrStep0004Paths, arrStep0004YearMonths
@@ -17136,7 +17281,7 @@ def main() -> int:
         )
         pszErrorDetail: str = str(objException)
         print(
-            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 and step0010 annual TSVs or step0010 Excel files, create variety deduction step0009 and step0010 annual TSVs or step0010 Excel files, add annual totals, or create step0011 and step0013 group annual TSV or Excel files, step0014 group deduction annual TSV or Excel files, or step0015 group deduction annual TSV files. Detail = "
+            "Error: failed to create, split, aggregate, extract, combine, concatenate, transpose, join annual groups, create annual Excel, add growth rates, create deduction variety step0008 and step0009 annual TSVs, create variety step0009 and step0010 annual TSVs or step0010 Excel files, create variety deduction step0009 and step0010 annual TSVs or step0010 Excel files, add annual totals, or create step0011 and step0013 group annual TSV or Excel files, step0014 group deduction annual TSV, step0015 group deduction annual TSV, or step0017 group deduction annual TSV or Excel files. Detail = "
             + pszErrorDetail,
             file=sys.stderr,
         )
@@ -17317,10 +17462,7 @@ def main() -> int:
         "step0014グループ別控除廃棄年間ファイル数: "
         + str(len(arrStep0014GroupDeductionPaths))
     )
-    print(
-        "step0014グループ別控除廃棄年間Excelファイル数: "
-        + str(len(arrStep0014GroupDeductionExcelPaths))
-    )
+    print("step0014グループ別控除廃棄年間Excelは作成しません。")
     print(
         "step0015グループ別控除廃棄年間ファイル数: "
         + str(len(arrStep0015GroupDeductionPaths))
@@ -17328,6 +17470,9 @@ def main() -> int:
     print("step0017グループ別控除廃棄年間ファイル数: " + str(len(arrStep0017GroupDeductionPaths)))
     for pszPath in arrStep0017GroupDeductionPaths:
         print("step0017グループ別控除廃棄年間ファイル: " + pszPath)
+    print("step0017グループ別控除廃棄年間Excelファイル数: " + str(len(arrStep0017GroupDeductionExcelPaths)))
+    for pszPath in arrStep0017GroupDeductionExcelPaths:
+        print("step0017グループ別控除廃棄年間Excelファイル: " + pszPath)
     print("step0016グループ別控除廃棄年間ファイル数: " + str(len(arrStep0016GroupDeductionPaths)))
     for pszPath in arrStep0016GroupDeductionPaths:
         print("step0016グループ別控除廃棄年間ファイル: " + pszPath)
@@ -17438,7 +17583,7 @@ def main() -> int:
     print("警告件数: " + str(iWarningCount))
     if pszWarningPath:
         print("警告ファイル: " + pszWarningPath)
-    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0013グループ別年間Excel作成・step0011・step0013グループ別年間TSV・step0013グループ別控除廃棄年間TSV・step0014グループ別控除廃棄年間Excel・step0015グループ別控除廃棄年間TSV作成完了 ◇")
+    print("◇ 変換・年月別分割・グループ別集計・43項目抽出・グループ別4項目結合・グループ別年間連結・年間行列入れ替え・年間グループ連結・育成率追加・控除廃棄品種別step0008・step0009・step0010年間TSV作成・step0010年間Excel作成・品種別step0009・step0010年間TSV・step0010年間Excel作成・控除廃棄品種別step0010年間TSV・Excel作成・年間合計追加・年間合計列追加・step0013グループ別年間Excel作成・step0011・step0013グループ別年間TSV・step0013グループ別控除廃棄年間TSV・step0014グループ別控除廃棄年間TSV・step0017グループ別控除廃棄年間Excel・step0015グループ別控除廃棄年間TSV作成完了 ◇")
     print("入力Excel: " + pszInputExcelPath)
     print("出力フォルダ: " + os.path.dirname(pszOutputTsvPath))
     return 0
