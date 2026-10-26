@@ -285,6 +285,13 @@ def run_excel_to_tsv(pszInputExcelPath: str) -> None:
     ]
     if arrStep0017Paths:
         pszMessage += "\n\n一日平均処理羽数の前年比付きstep0017 TSV:\n" + "\n".join(arrStep0017Paths)
+    arrStep0013Paths: List[str] = [
+        line[len("step0013グループ別年間ファイル: ") :]
+        for line in pszStdOut.splitlines()
+        if line.startswith("step0013グループ別年間ファイル: ")
+    ]
+    if arrStep0013Paths:
+        pszMessage += "\n\n一日平均出荷羽数の前年比付きstep0013 TSV:\n" + "\n".join(arrStep0013Paths)
     if pszWarningFilePath:
         pszMessage += "\n\n警告ファイル:\n" + pszWarningFilePath
     show_completion_dialog(os.path.dirname(pszOutputTsvPath), bool(pszWarningFilePath), pszMessage)
@@ -534,6 +541,8 @@ def draw_instruction_text(iWindowHandle: int) -> None:
         "step0011当年表に空行2行と前年の合計6行を加え、step0012グループ別年間TSVを出力します。\n"
         "前年欄は前年実績・前年の年表記とし、2022年は前年行を追加しません。\n"
         "step0012の当年・前年の稼動日数合計をO列に整数で出力します。\n"
+        "step0012の24・25行目に一日平均出荷羽数の前年比を追加したstep0013を出力します。\n"
+        "前年比は小数点以下4桁で四捨五入し、計算不能は空欄、2022年はそのままコピーします。\n"
         "step0015控除廃棄当年表にも空行2行と前年の合計6行を加え、step0016を出力します。\n"
         "項目は入雛羽数・処理羽数・処理重量・平均体重・育成率・稼動日数です。\n"
         "前年欄は前年実績・前年の年表記とし、2022年は前年行を追加しません。\n"
