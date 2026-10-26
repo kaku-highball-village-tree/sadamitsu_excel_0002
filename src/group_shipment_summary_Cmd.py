@@ -15467,7 +15467,8 @@ def read_step0013_group_for_excel(pszInputPath: str) -> List[List[str]]:
                 iRowIndex,
                 iColumnIndex,
                 pszItemName,
-                pszItemName in {"平均体重", "育成率"} and iColumnIndex < 14,
+                pszItemName in {"平均体重", "育成率", "稼動日数"}
+                and iColumnIndex < 14,
             )
 
     if bHasPreviousYear:
@@ -15505,7 +15506,8 @@ def read_step0013_group_for_excel(pszInputPath: str) -> List[List[str]]:
                     iRowIndex,
                     iColumnIndex,
                     pszItemName,
-                    pszItemName in {"平均体重", "育成率"} and iColumnIndex < 14,
+                    pszItemName in {"平均体重", "育成率", "稼動日数"}
+                    and iColumnIndex < 14,
                 )
     return arrRows
 
