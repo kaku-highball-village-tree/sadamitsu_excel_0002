@@ -16471,6 +16471,89 @@ def create_step0011_group_files(
         raise
 
 
+def create_step0011_variety_files(
+    arrStep0010Paths: List[str], arrDailyOperationPaths: List[str]
+) -> List[str]:
+    """品種別step0010年間TSVに全品種共通の稼動日数行を追加します。"""
+    dicDailyPaths: Dict[Tuple[str, str, int], str] = {}
+    for pszDailyPath in arrDailyOperationPaths:
+        pszPrefix, iYear = parse_daily_operation_file_name(pszDailyPath)
+        objKey = (os.path.dirname(os.path.abspath(pszDailyPath)), pszPrefix, iYear)
+        if objKey in dicDailyPaths:
+            raise_conversion_error(
+                "DUPLICATE_STEP0011_VARIETY_DAILY_INPUT",
+                "duplicate daily operation input. Path = " + pszDailyPath,
+            )
+        dicDailyPaths[objKey] = pszDailyPath
+
+    arrCreatedPaths: List[str] = []
+    try:
+        for pszStep0010Path in arrStep0010Paths:
+            objMatch = re.fullmatch(
+                r"(.+)_step0010_品種別_(\d{4})_年間(?:_\d{2})?\.tsv",
+                os.path.basename(pszStep0010Path),
+            )
+            if objMatch is None:
+                raise_conversion_error(
+                    "INVALID_STEP0010_VARIETY_FILENAME",
+                    "unexpected variety step0010 file name. Path = "
+                    + pszStep0010Path,
+                )
+            pszPrefix, iYearText = objMatch.groups()
+            iYear = int(iYearText)
+            objKey = (
+                os.path.dirname(os.path.abspath(pszStep0010Path)), pszPrefix, iYear
+            )
+            pszDailyPath = dicDailyPaths.get(objKey)
+            if pszDailyPath is None:
+                raise_conversion_error(
+                    "MISSING_STEP0011_VARIETY_DAILY_INPUT",
+                    "matching daily operation TSV was not found. Path = "
+                    + pszStep0010Path,
+                )
+            arrRows = read_step0010_variety_for_excel(pszStep0010Path)
+            arrDayCounts = read_daily_operation_row_for_step0015(
+                pszDailyPath, pszPrefix, iYear
+            )
+            arrRows.append(["", "稼動日数"] + arrDayCounts + [""])
+            pszOutputPath = os.path.join(
+                os.path.dirname(pszStep0010Path),
+                os.path.basename(pszStep0010Path).replace(
+                    "_step0010_", "_step0011_", 1
+                ),
+            )
+            pszStem, pszExtension = os.path.splitext(pszOutputPath)
+            iSuffix = 2
+            while os.path.exists(pszOutputPath):
+                pszOutputPath = f"{pszStem}_{iSuffix:02d}{pszExtension}"
+                iSuffix += 1
+            try:
+                write_monthly_tsv(
+                    pszOutputPath,
+                    "\t".join(arrRows[0]),
+                    ["\t".join(row) for row in arrRows[1:]],
+                )
+            except ConversionError as objException:
+                raise_conversion_error("STEP0011_VARIETY_WRITE_FAILED", str(objException))
+            arrCreatedPaths.append(pszOutputPath)
+        return arrCreatedPaths
+    except Exception as objException:
+        arrCleanupErrors: List[str] = []
+        for pszPath in arrCreatedPaths:
+            try:
+                os.remove(pszPath)
+            except Exception as objCleanupException:
+                arrCleanupErrors.append(pszPath + ": " + str(objCleanupException))
+        if arrCleanupErrors:
+            raise_conversion_error(
+                "STEP0011_VARIETY_CLEANUP_FAILED",
+                "step0011 variety creation failed. Original error = "
+                + str(objException) + "; cleanup errors = "
+                + " | ".join(arrCleanupErrors),
+            )
+        raise
+
+
 def create_step0012_group_files(arrStep0011Paths: List[str]) -> List[str]:
     """当年表に前年合計6行を追加し、稼動日数の年間合計を出力します。"""
     dicInputs: Dict[Tuple[str, str, int], str] = {}
@@ -17048,6 +17131,9 @@ def main() -> int:
         arrStep0010VarietyExcelPaths = create_step0010_variety_excel_files(
             arrStep0010VarietyAnnualPaths
         )
+        arrStep0011VarietyPaths = create_step0011_variety_files(
+            arrStep0010VarietyAnnualPaths, arrDailyOperationPaths
+        )
         (
             arrStep0004VarietyDeductionPaths,
             arrStep0004VarietyDeductionYearMonths,
@@ -17429,6 +17515,9 @@ def main() -> int:
         "step0010品種別年間Excelファイル数: "
         + str(len(arrStep0010VarietyExcelPaths))
     )
+    print("step0011品種別年間ファイル数: " + str(len(arrStep0011VarietyPaths)))
+    for pszPath in arrStep0011VarietyPaths:
+        print("step0011品種別年間ファイル: " + pszPath)
     print(
         "step0003品種別廃棄控除前育成率ファイル数: "
         + str(len(arrStep0003VarietyPreDiscardGrowthRatePaths))
